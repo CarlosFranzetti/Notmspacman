@@ -18,6 +18,7 @@ import Animated, {
   withSequence,
   withDelay,
   runOnJS,
+  withRepeat,
 } from 'react-native-reanimated';
 import { useGameStore, MAZE_LAYOUT, MAZE_WIDTH, MAZE_HEIGHT, Direction, FruitType } from './store';
 
@@ -107,8 +108,18 @@ class SoundMgr {
   
   power() { [392, 494, 587, 784].forEach((f, i) => setTimeout(() => this.tone(f, 0.05, 'sine', 0.02), i * 40)); }
   ghost() { if (this.ctx) { try { const o = this.ctx.createOscillator(), g = this.ctx.createGain(); o.connect(g); g.connect(this.ctx.destination); o.type = 'sine'; o.frequency.setValueAtTime(150, this.ctx.currentTime); o.frequency.exponentialRampToValueAtTime(500, this.ctx.currentTime + 0.1); g.gain.setValueAtTime(0.025, this.ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + 0.12); o.start(); o.stop(this.ctx.currentTime + 0.12); } catch {} } }
-  death() { [320, 280, 240, 200, 160].forEach((f, i) => setTimeout(() => this.tone(f, 0.07, 'sine', 0.018), i * 80)); }
-  level() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => this.tone(f, 0.08, 'sine', 0.02), i * 80)); }
+  // Classic Ms. Pac-Man death: rapid descending chromatic glissando
+  death() {
+    const notes = [392, 370, 349, 330, 311, 294, 277, 262, 247, 233, 220, 196, 175, 156, 139, 123, 110];
+    notes.forEach((f, i) => setTimeout(() => this.tone(f, 0.06, 'square', 0.016), i * 65));
+  }
+  // Level complete jingle: ascending fanfare
+  level() {
+    const seq = [523, 659, 784, 659, 784, 1047];
+    const durs = [0.1, 0.1, 0.1, 0.08, 0.08, 0.22];
+    let t = 0;
+    seq.forEach((f, i) => { setTimeout(() => this.tone(f, durs[i], 'square', 0.018), t * 1000); t += durs[i] + 0.02; });
+  }
   async init() { if (Platform.OS === 'web' && this.ctx?.state === 'suspended') await this.ctx.resume(); }
 }
 
@@ -129,6 +140,8 @@ export default function GameScreen() {
   const [introStep, setIntroStep] = useState(0);
   const [deathAnim, setDeathAnim] = useState(0);
   const [isDying, setIsDying] = useState(false);
+  // TV turn-off animation state
+  const [showGameOver, setShowGameOver] = useState(false);
   
   // Smooth interpolated positions
   const pX = useSharedValue(13 * CELL_SIZE);
@@ -137,6 +150,10 @@ export default function GameScreen() {
   const pMouth = useSharedValue(0);
   const pScale = useSharedValue(1);
   const pDeathRot = useSharedValue(0);
+
+  // TV-off animation values
+  const tvScaleY = useSharedValue(1);
+  const tvGlow = useSharedValue(0);
 
   const {
     playerPosition, playerDirection, lives, score, highScore, level,
@@ -227,7 +244,64 @@ export default function GameScreen() {
     }
   }, [intro]);
 
-  // Gestures
+  // Death animation — spin + shrink when dying
+  useEffect(() => {
+    if (gameStatus === 'dying') {
+      setIsDying(true);
+      snd.death();
+      // Rapid spinning shrink (mirrors classic arcade death)
+      pDeathRot.value = withSequence(
+        withTiming(180, { duration: 150 }),
+        withTiming(360, { duration: 150 }),
+        withTiming(540, { duration: 200 }),
+        withTiming(720, { duration: 250 }),
+        withTiming(900, { duration: 300 }),
+        withTiming(1080, { duration: 350 }),
+      );
+      pScale.value = withSequence(
+        withDelay(400, withTiming(0.6, { duration: 200 })),
+        withTiming(0, { duration: 400, easing: Easing.in(Easing.cubic) }),
+      );
+    } else {
+      setIsDying(false);
+      pDeathRot.value = 0;
+      pScale.value = 1;
+    }
+  }, [gameStatus]);
+
+  // TV turn-off animation when game over
+  useEffect(() => {
+    if (gameStatus === 'gameover') {
+      setShowGameOver(false);
+      let t2: ReturnType<typeof setTimeout> | null = null;
+      // Brief delay then squish
+      const t1 = setTimeout(() => {
+        // Squish screen to horizontal line
+        tvScaleY.value = withTiming(0.012, { duration: 500, easing: Easing.in(Easing.cubic) });
+        // Flash bright then fade
+        tvGlow.value = withSequence(
+          withTiming(1, { duration: 250 }),
+          withDelay(250, withTiming(0, { duration: 700 })),
+        );
+        // Show game-over overlay after animation
+        t2 = setTimeout(() => setShowGameOver(true), 1600);
+      }, 400);
+      return () => {
+        clearTimeout(t1);
+        if (t2) clearTimeout(t2);
+      };
+    } else {
+      tvScaleY.value = withTiming(1, { duration: 100 });
+      tvGlow.value = 0;
+      setShowGameOver(false);
+    }
+  }, [gameStatus]);
+
+  // Level-complete sound
+  useEffect(() => {
+    if (gameStatus === 'levelcomplete') snd.level();
+  }, [gameStatus]);
+
   const pan = Gesture.Pan().onEnd(e => {
     const { translationX: tx, translationY: ty } = e;
     if (Math.abs(tx) > Math.abs(ty)) setDirection(tx > 6 ? 'right' : tx < -6 ? 'left' : playerDirection);
@@ -258,13 +332,16 @@ export default function GameScreen() {
     return c;
   }, [pellets, powerPellets, flash]);
 
-  // Player animated style
+  // Player animated style — incorporates both direction rotation and death spin/scale
   const playerStyle = useAnimatedStyle(() => {
     const off = (CHARACTER_SIZE - CELL_SIZE) / 2;
     return {
       left: pX.value - off,
       top: pY.value - off,
-      transform: [{ rotate: `${pRot.value}deg` }],
+      transform: [
+        { rotate: `${pRot.value + pDeathRot.value}deg` },
+        { scale: pScale.value },
+      ],
     };
   });
 
@@ -453,6 +530,14 @@ export default function GameScreen() {
     return null;
   };
 
+  // TV off animated styles
+  const tvStyle = useAnimatedStyle(() => ({
+    transform: [{ scaleY: tvScaleY.value }],
+  }));
+  const tvGlowStyle = useAnimatedStyle(() => ({
+    opacity: tvGlow.value,
+  }));
+
   return (
     <View style={st.container}>
       <View style={st.scores}>
@@ -467,14 +552,20 @@ export default function GameScreen() {
       </View>
 
       <GestureDetector gesture={pan}>
-        <View style={st.border}>
+        {/* TV-off wrapper — scaleY collapses on game over */}
+        <Animated.View style={[st.border, tvStyle]}>
           <View style={[st.game, { width: GAME_WIDTH, height: GAME_HEIGHT }]}>
             {maze}
             {gameStatus !== 'ready' && gameStatus !== 'gameover' && !intro && renderMsPacMan()}
             {gameStatus !== 'ready' && gameStatus !== 'gameover' && !intro && renderGhosts()}
-            {renderOverlay()}
+            {/* CRT pixel overlay — visible on native; CSS handles it on web */}
+            <View style={st.crtOverlay} pointerEvents="none" />
+            {/* Overlays: game-over only shows after TV-off animation completes */}
+            {gameStatus === 'gameover' ? (showGameOver && renderOverlay()) : renderOverlay()}
           </View>
-        </View>
+          {/* TV-off bright flash */}
+          <Animated.View style={[StyleSheet.absoluteFillObject, st.tvFlash, tvGlowStyle]} pointerEvents="none" />
+        </Animated.View>
       </GestureDetector>
 
       {gameStatus === 'playing' && !intro && renderDPad()}
@@ -523,8 +614,8 @@ const st = StyleSheet.create({
   eyeHL: { position: 'absolute', top: 0, left: 0, width: 2, height: 2, backgroundColor: '#444', borderRadius: 1 },
   pupil: { position: 'absolute', bottom: 1, right: 0, width: 2, height: 2, backgroundColor: '#222', borderRadius: 1 },
   
-  // Refined bow
-  bow: { position: 'absolute', top: -5, left: '15%', width: 16, height: 12 },
+  // Refined bow — centered on top of head (more faithful to arcade)
+  bow: { position: 'absolute', top: -6, left: '28%', width: 16, height: 12 },
   bowL: { position: 'absolute', left: 0, top: 3, width: 7, height: 7, backgroundColor: COLORS.bowRed, borderRadius: 3.5, transform: [{ rotate: '-12deg' }], overflow: 'hidden' },
   bowLHL: { position: 'absolute', top: 1, left: 1, width: 2.5, height: 2.5, backgroundColor: COLORS.bowLight, borderRadius: 1.25 },
   bowLSH: { position: 'absolute', bottom: 0, right: 0, width: 3, height: 3, backgroundColor: COLORS.bowDark, borderRadius: 1.5 },
@@ -586,4 +677,8 @@ const st = StyleSheet.create({
   introRow: { flexDirection: 'row', marginTop: 18 },
   introG: { width: 18, height: 18, borderTopLeftRadius: 9, borderTopRightRadius: 9, marginHorizontal: 3 },
   powInd: { color: '#FFB8FF', fontSize: 10, fontWeight: 'bold', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', marginTop: 7 },
+  // CRT scanline overlay (semi-transparent for native; CSS handles web)
+  crtOverlay: { ...StyleSheet.absoluteFillObject, zIndex: 20, opacity: Platform.OS === 'web' ? 0 : 0.07 },
+  // TV turn-off flash
+  tvFlash: { backgroundColor: '#FFFFFF', zIndex: 25 },
 });

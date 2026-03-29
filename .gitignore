@@ -79,11 +79,16 @@ agenthub/agents/youtube/db
 memory/test_credentials.md
 
 # Mobile development
-android-sdk/-e 
+android-sdk/
+
 # Environment files
 *.env
 *.env.*
--e 
-# Environment files
-*.env
-*.env.*
+
+# Agent / build artifacts (not part of the game)
+.emergent/
+memory/
+test_reports/
+tests/
+test_result.md
+.gitconfig

@@ -127,12 +127,16 @@ export default function GameScreen() {
   const [flash, setFlash] = useState(false);
   const [intro, setIntro] = useState(false);
   const [introStep, setIntroStep] = useState(0);
+  const [deathAnim, setDeathAnim] = useState(0);
+  const [isDying, setIsDying] = useState(false);
   
   // Smooth interpolated positions
   const pX = useSharedValue(13 * CELL_SIZE);
   const pY = useSharedValue(23 * CELL_SIZE);
   const pRot = useSharedValue(180);
   const pMouth = useSharedValue(0);
+  const pScale = useSharedValue(1);
+  const pDeathRot = useSharedValue(0);
 
   const {
     playerPosition, playerDirection, lives, score, highScore, level,

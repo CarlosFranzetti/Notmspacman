@@ -1,4 +1,24 @@
 import { create } from 'zustand';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const HIGH_SCORE_KEY = '@ms_pacman_high_score';
+
+async function loadHighScore(): Promise<number> {
+  try {
+    const val = await AsyncStorage.getItem(HIGH_SCORE_KEY);
+    return val ? parseInt(val, 10) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function saveHighScore(score: number): Promise<void> {
+  try {
+    await AsyncStorage.setItem(HIGH_SCORE_KEY, score.toString());
+  } catch {
+    // ignore storage errors
+  }
+}
 
 export type Direction = 'up' | 'down' | 'left' | 'right';
 export type GhostMode = 'scatter' | 'chase' | 'frightened' | 'eaten';
@@ -525,6 +545,7 @@ export const useGameStore = create<GameState>(
       loseLife: () => {
         const { lives, score, highScore } = get();
         const newHighScore = Math.max(score, highScore);
+        if (newHighScore > highScore) saveHighScore(newHighScore);
         
         if (lives <= 1) {
           set({ lives: 0, gameStatus: 'gameover', highScore: newHighScore });
@@ -549,12 +570,14 @@ export const useGameStore = create<GameState>(
                 gameTime: 0,
               });
             }
-          }, 1500);
+          }, 1800);
         }
       },
 
       nextLevel: () => {
         const { level, score, highScore } = get();
+        const newHighScore = Math.max(score, highScore);
+        if (newHighScore > highScore) saveHighScore(newHighScore);
         set({
           level: level + 1,
           pellets: initializePellets(),
@@ -568,7 +591,7 @@ export const useGameStore = create<GameState>(
           ghostsEatenCombo: 0,
           fruit: null,
           gameStatus: 'playing',
-          highScore: Math.max(score, highScore),
+          highScore: newHighScore,
           gameTime: 0,
         });
       },
@@ -583,7 +606,14 @@ export const useGameStore = create<GameState>(
     })
 );
 
-// Helper functions
+// Load persisted high score on startup
+loadHighScore().then(hs => {
+  if (hs > 0) useGameStore.setState({ highScore: hs });
+}).catch(() => {
+  // Silently ignore if storage is unavailable
+});
+
+
 function getNextPosition(pos: Position, dir: Direction): Position {
   switch (dir) {
     case 'up': return { x: pos.x, y: pos.y - 1 };

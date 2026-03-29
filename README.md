@@ -67,6 +67,27 @@ yarn start      # Expo dev server (scan QR for mobile)
 
 ## ☁️ Deploying to Vercel
 
+### Option A — Automatic (GitHub Actions)
+
+The repo includes a `.github/workflows/deploy.yml` that deploys on every push to `main` and creates preview deployments for pull requests.
+
+**One-time setup:**
+
+1. Import the repo in [vercel.com](https://vercel.com) — this creates the Vercel project and links it to the repo.
+2. In your Vercel project settings, copy the **Project ID** and **Org/Team ID** from `Settings → General`.
+3. Create a Vercel token at [vercel.com/account/tokens](https://vercel.com/account/tokens).
+4. Add the following secrets to your GitHub repository (`Settings → Secrets and variables → Actions`):
+
+   | Secret name | Where to find it |
+   |---|---|
+   | `VERCEL_TOKEN` | Vercel account tokens page |
+   | `VERCEL_ORG_ID` | Vercel project → Settings → General |
+   | `VERCEL_PROJECT_ID` | Vercel project → Settings → General |
+
+5. Push to `main` — the action deploys automatically.
+
+### Option B — Manual
+
 1. Import the repo in [vercel.com](https://vercel.com)
 2. Vercel auto-reads `vercel.json` at the root — no extra setup needed
 3. Build command: `cd frontend && yarn install && npx expo export --platform web`

@@ -2,6 +2,7 @@ import { create } from 'zustand';
 
 export type Direction = 'up' | 'down' | 'left' | 'right';
 export type GhostMode = 'scatter' | 'chase' | 'frightened' | 'eaten';
+export type FruitType = 'cherry' | 'strawberry' | 'orange' | 'pretzel' | 'apple' | 'pear' | 'banana';
 
 export interface Position {
   x: number;
@@ -16,6 +17,15 @@ export interface Ghost {
   direction: Direction;
   mode: GhostMode;
   scatterTarget: Position;
+  releaseTime: number; // When ghost leaves the house
+}
+
+export interface Fruit {
+  type: FruitType;
+  position: Position;
+  points: number;
+  active: boolean;
+  expiresAt: number;
 }
 
 export interface GameState {
@@ -33,12 +43,21 @@ export interface GameState {
   powerPellets: Position[];
   powerPelletActive: boolean;
   powerPelletTimer: number;
+  pelletsEaten: number;
+  
+  // Fruit bonus
+  fruit: Fruit | null;
   
   // Ghosts
   ghosts: Ghost[];
+  ghostsEatenCombo: number; // For combo scoring
   
   // Game flow
   gameStatus: 'ready' | 'playing' | 'paused' | 'gameover' | 'levelcomplete' | 'dying';
+  gameTime: number; // Time in current level
+  
+  // Sound enabled
+  soundEnabled: boolean;
   
   // Actions
   startGame: () => void;
@@ -54,6 +73,10 @@ export interface GameState {
   decrementPowerTimer: () => void;
   nextLevel: () => void;
   loseLife: () => void;
+  spawnFruit: () => void;
+  eatFruit: () => void;
+  incrementGameTime: () => void;
+  toggleSound: () => void;
 }
 
 // Classic maze layout - 28x31 grid
@@ -95,8 +118,24 @@ export const MAZE_LAYOUT: number[][] = [
 export const MAZE_WIDTH = 28;
 export const MAZE_HEIGHT = 31;
 
+// Fruit configuration by level
+const FRUIT_CONFIG: Record<number, { type: FruitType; points: number }> = {
+  1: { type: 'cherry', points: 100 },
+  2: { type: 'strawberry', points: 300 },
+  3: { type: 'orange', points: 500 },
+  4: { type: 'orange', points: 500 },
+  5: { type: 'pretzel', points: 700 },
+  6: { type: 'pretzel', points: 700 },
+  7: { type: 'apple', points: 1000 },
+  8: { type: 'apple', points: 1000 },
+  9: { type: 'pear', points: 2000 },
+  10: { type: 'pear', points: 2000 },
+  11: { type: 'banana', points: 5000 },
+  12: { type: 'banana', points: 5000 },
+};
+
 // Ghost characters with pun names
-const INITIAL_GHOSTS: Ghost[] = [
+const createInitialGhosts = (): Ghost[] => [
   {
     id: 'blinky',
     name: 'Blinky McBlinkface',
@@ -105,6 +144,7 @@ const INITIAL_GHOSTS: Ghost[] = [
     direction: 'left',
     mode: 'scatter',
     scatterTarget: { x: 25, y: 0 },
+    releaseTime: 0, // Immediately active
   },
   {
     id: 'pinky',
@@ -114,6 +154,7 @@ const INITIAL_GHOSTS: Ghost[] = [
     direction: 'up',
     mode: 'scatter',
     scatterTarget: { x: 2, y: 0 },
+    releaseTime: 30, // Release after 3 seconds
   },
   {
     id: 'inky',
@@ -123,6 +164,7 @@ const INITIAL_GHOSTS: Ghost[] = [
     direction: 'up',
     mode: 'scatter',
     scatterTarget: { x: 27, y: 30 },
+    releaseTime: 60, // Release after 6 seconds
   },
   {
     id: 'sue',
@@ -132,10 +174,12 @@ const INITIAL_GHOSTS: Ghost[] = [
     direction: 'up',
     mode: 'scatter',
     scatterTarget: { x: 0, y: 30 },
+    releaseTime: 90, // Release after 9 seconds
   },
 ];
 
 const PLAYER_START: Position = { x: 13, y: 23 };
+const FRUIT_POSITION: Position = { x: 13, y: 17 }; // Below ghost house
 
 function initializePellets(): boolean[][] {
   const pellets: boolean[][] = [];
@@ -160,298 +204,384 @@ function initializePowerPellets(): Position[] {
   return powerPellets;
 }
 
-export const useGameStore = create<GameState>((set, get) => ({
-  // Initial state
-  playerPosition: { ...PLAYER_START },
-  playerDirection: 'left',
-  nextDirection: null,
-  lives: 3,
-  score: 0,
-  highScore: 0,
-  level: 1,
-  pellets: initializePellets(),
-  powerPellets: initializePowerPellets(),
-  powerPelletActive: false,
-  powerPelletTimer: 0,
-  ghosts: INITIAL_GHOSTS.map(g => ({ ...g, position: { ...g.position } })),
-  gameStatus: 'ready',
+function countTotalPellets(): number {
+  let count = 0;
+  for (let y = 0; y < MAZE_HEIGHT; y++) {
+    for (let x = 0; x < MAZE_WIDTH; x++) {
+      if (MAZE_LAYOUT[y][x] === 2 || MAZE_LAYOUT[y][x] === 3) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
 
-  startGame: () => {
-    set({
-      gameStatus: 'playing',
-      playerPosition: { ...PLAYER_START },
-      playerDirection: 'left',
-      nextDirection: null,
-    });
-  },
+const TOTAL_PELLETS = countTotalPellets();
 
-  pauseGame: () => {
-    set({ gameStatus: 'paused' });
-  },
-
-  resumeGame: () => {
-    set({ gameStatus: 'playing' });
-  },
-
-  resetGame: () => {
-    set({
+export const useGameStore = create<GameState>(
+  (set, get) => ({
+      // Initial state
       playerPosition: { ...PLAYER_START },
       playerDirection: 'left',
       nextDirection: null,
       lives: 3,
       score: 0,
+      highScore: 0,
       level: 1,
       pellets: initializePellets(),
       powerPellets: initializePowerPellets(),
       powerPelletActive: false,
       powerPelletTimer: 0,
-      ghosts: INITIAL_GHOSTS.map(g => ({ ...g, position: { ...g.position }, mode: 'scatter' })),
+      pelletsEaten: 0,
+      fruit: null,
+      ghosts: createInitialGhosts(),
+      ghostsEatenCombo: 0,
       gameStatus: 'ready',
-    });
-  },
+      gameTime: 0,
+      soundEnabled: true,
 
-  setDirection: (direction: Direction) => {
-    const { playerPosition, gameStatus } = get();
-    if (gameStatus !== 'playing') return;
-    
-    const nextPos = getNextPosition(playerPosition, direction);
-    if (canMoveTo(nextPos)) {
-      set({ playerDirection: direction, nextDirection: null });
-    } else {
-      set({ nextDirection: direction });
-    }
-  },
-
-  movePlayer: () => {
-    const { playerPosition, playerDirection, nextDirection, gameStatus } = get();
-    if (gameStatus !== 'playing') return;
-
-    // Try next direction first if set
-    if (nextDirection) {
-      const nextPos = getNextPosition(playerPosition, nextDirection);
-      if (canMoveTo(nextPos)) {
-        set({ 
-          playerDirection: nextDirection, 
+      startGame: () => {
+        set({
+          gameStatus: 'playing',
+          playerPosition: { ...PLAYER_START },
+          playerDirection: 'left',
           nextDirection: null,
-          playerPosition: wrapPosition(nextPos),
+          gameTime: 0,
+          ghostsEatenCombo: 0,
         });
-        return;
-      }
-    }
+      },
 
-    // Otherwise continue in current direction
-    const nextPos = getNextPosition(playerPosition, playerDirection);
-    if (canMoveTo(nextPos)) {
-      set({ playerPosition: wrapPosition(nextPos) });
-    }
-  },
+      pauseGame: () => {
+        set({ gameStatus: 'paused' });
+      },
 
-  eatPellet: () => {
-    const { playerPosition, pellets, powerPellets, score } = get();
-    const { x, y } = playerPosition;
-    
-    // Check regular pellet
-    if (pellets[y] && pellets[y][x]) {
-      const newPellets = [...pellets];
-      newPellets[y] = [...newPellets[y]];
-      newPellets[y][x] = false;
-      set({ pellets: newPellets, score: score + 10 });
-      
-      // Check if level complete
-      const remainingPellets = newPellets.flat().filter(p => p).length;
-      const remainingPower = get().powerPellets.length;
-      if (remainingPellets === 0 && remainingPower === 0) {
-        set({ gameStatus: 'levelcomplete' });
-      }
-    }
-    
-    // Check power pellet
-    const powerIndex = powerPellets.findIndex(p => p.x === x && p.y === y);
-    if (powerIndex !== -1) {
-      const newPowerPellets = powerPellets.filter((_, i) => i !== powerIndex);
-      set({ powerPellets: newPowerPellets, score: score + 50 });
-      get().activatePowerPellet();
-      
-      // Check if level complete
-      const remainingPellets = get().pellets.flat().filter(p => p).length;
-      if (remainingPellets === 0 && newPowerPellets.length === 0) {
-        set({ gameStatus: 'levelcomplete' });
-      }
-    }
-  },
+      resumeGame: () => {
+        set({ gameStatus: 'playing' });
+      },
 
-  activatePowerPellet: () => {
-    const { ghosts } = get();
-    const frightenedGhosts = ghosts.map(g => ({
-      ...g,
-      mode: g.mode !== 'eaten' ? 'frightened' as GhostMode : g.mode,
-    }));
-    set({ 
-      powerPelletActive: true, 
-      powerPelletTimer: 80, // ~8 seconds at 10fps
-      ghosts: frightenedGhosts,
-    });
-  },
-
-  decrementPowerTimer: () => {
-    const { powerPelletTimer, ghosts } = get();
-    if (powerPelletTimer > 0) {
-      const newTimer = powerPelletTimer - 1;
-      if (newTimer === 0) {
-        const normalGhosts = ghosts.map(g => ({
-          ...g,
-          mode: g.mode === 'frightened' ? 'chase' as GhostMode : g.mode,
-        }));
-        set({ powerPelletActive: false, powerPelletTimer: 0, ghosts: normalGhosts });
-      } else {
-        set({ powerPelletTimer: newTimer });
-      }
-    }
-  },
-
-  moveGhosts: () => {
-    const { ghosts, playerPosition, gameStatus } = get();
-    if (gameStatus !== 'playing') return;
-
-    const newGhosts = ghosts.map(ghost => {
-      const directions: Direction[] = ['up', 'down', 'left', 'right'];
-      const opposite: Record<Direction, Direction> = {
-        up: 'down',
-        down: 'up',
-        left: 'right',
-        right: 'left',
-      };
-
-      // Get valid directions (not walls, not opposite unless necessary)
-      let validDirections = directions.filter(dir => {
-        if (dir === opposite[ghost.direction]) return false;
-        const nextPos = getNextPosition(ghost.position, dir);
-        return canGhostMoveTo(nextPos);
-      });
-
-      if (validDirections.length === 0) {
-        validDirections = directions.filter(dir => {
-          const nextPos = getNextPosition(ghost.position, dir);
-          return canGhostMoveTo(nextPos);
+      resetGame: () => {
+        set({
+          playerPosition: { ...PLAYER_START },
+          playerDirection: 'left',
+          nextDirection: null,
+          lives: 3,
+          score: 0,
+          level: 1,
+          pellets: initializePellets(),
+          powerPellets: initializePowerPellets(),
+          powerPelletActive: false,
+          powerPelletTimer: 0,
+          pelletsEaten: 0,
+          fruit: null,
+          ghosts: createInitialGhosts(),
+          ghostsEatenCombo: 0,
+          gameStatus: 'ready',
+          gameTime: 0,
         });
-      }
+      },
 
-      if (validDirections.length === 0) return ghost;
-
-      let targetDir: Direction;
-      
-      if (ghost.mode === 'frightened') {
-        // Random movement when frightened
-        targetDir = validDirections[Math.floor(Math.random() * validDirections.length)];
-      } else if (ghost.mode === 'eaten') {
-        // Return to ghost house
-        const target = { x: 13, y: 14 };
-        targetDir = getBestDirection(ghost.position, target, validDirections);
+      setDirection: (direction: Direction) => {
+        const { playerPosition, gameStatus } = get();
+        if (gameStatus !== 'playing') return;
         
-        // Check if reached ghost house
-        if (ghost.position.x === target.x && ghost.position.y === target.y) {
-          return { ...ghost, mode: 'scatter' as GhostMode };
-        }
-      } else {
-        // Chase or scatter mode
-        let target: Position;
-        if (ghost.mode === 'chase') {
-          target = playerPosition;
-          // Different targeting for each ghost
-          if (ghost.id === 'pinky') {
-            // Target 4 tiles ahead of player
-            target = { x: playerPosition.x + 4, y: playerPosition.y };
-          } else if (ghost.id === 'inky') {
-            // More complex targeting
-            target = { x: playerPosition.x * 2 - 2, y: playerPosition.y };
-          } else if (ghost.id === 'sue') {
-            // Random scatter when close
-            const dist = Math.abs(ghost.position.x - playerPosition.x) + Math.abs(ghost.position.y - playerPosition.y);
-            if (dist < 8) {
-              target = ghost.scatterTarget;
-            }
-          }
+        const nextPos = getNextPosition(playerPosition, direction);
+        if (canMoveTo(nextPos)) {
+          set({ playerDirection: direction, nextDirection: null });
         } else {
-          target = ghost.scatterTarget;
+          set({ nextDirection: direction });
         }
-        targetDir = getBestDirection(ghost.position, target, validDirections);
-      }
+      },
 
-      const newPos = wrapPosition(getNextPosition(ghost.position, targetDir));
-      return { ...ghost, position: newPos, direction: targetDir };
-    });
+      movePlayer: () => {
+        const { playerPosition, playerDirection, nextDirection, gameStatus } = get();
+        if (gameStatus !== 'playing') return;
 
-    set({ ghosts: newGhosts });
-  },
-
-  checkGhostCollision: () => {
-    const { playerPosition, ghosts, score, powerPelletActive } = get();
-    
-    for (const ghost of ghosts) {
-      const dx = Math.abs(playerPosition.x - ghost.position.x);
-      const dy = Math.abs(playerPosition.y - ghost.position.y);
-      
-      if (dx < 1 && dy < 1) {
-        if (ghost.mode === 'frightened') {
-          // Eat ghost
-          const newGhosts = ghosts.map(g => 
-            g.id === ghost.id ? { ...g, mode: 'eaten' as GhostMode } : g
-          );
-          set({ ghosts: newGhosts, score: score + 200 });
-        } else if (ghost.mode !== 'eaten') {
-          // Player dies
-          get().loseLife();
+        // Try next direction first if set
+        if (nextDirection) {
+          const nextPos = getNextPosition(playerPosition, nextDirection);
+          if (canMoveTo(nextPos)) {
+            set({ 
+              playerDirection: nextDirection, 
+              nextDirection: null,
+              playerPosition: wrapPosition(nextPos),
+            });
+            return;
+          }
         }
-        return;
-      }
-    }
-  },
 
-  loseLife: () => {
-    const { lives, score, highScore } = get();
-    const newHighScore = Math.max(score, highScore);
-    
-    if (lives <= 1) {
-      set({ lives: 0, gameStatus: 'gameover', highScore: newHighScore });
-    } else {
-      set({ 
-        lives: lives - 1, 
-        gameStatus: 'dying',
-        highScore: newHighScore,
-      });
-      // Reset positions after brief pause
-      setTimeout(() => {
-        const state = get();
-        if (state.gameStatus === 'dying') {
-          set({
-            playerPosition: { ...PLAYER_START },
-            playerDirection: 'left',
-            ghosts: INITIAL_GHOSTS.map(g => ({ ...g, position: { ...g.position }, mode: 'scatter' })),
-            powerPelletActive: false,
-            powerPelletTimer: 0,
-            gameStatus: 'playing',
+        // Otherwise continue in current direction
+        const nextPos = getNextPosition(playerPosition, playerDirection);
+        if (canMoveTo(nextPos)) {
+          set({ playerPosition: wrapPosition(nextPos) });
+        }
+      },
+
+      eatPellet: () => {
+        const { playerPosition, pellets, powerPellets, score, pelletsEaten } = get();
+        const { x, y } = playerPosition;
+        
+        // Check regular pellet
+        if (pellets[y] && pellets[y][x]) {
+          const newPellets = [...pellets];
+          newPellets[y] = [...newPellets[y]];
+          newPellets[y][x] = false;
+          const newPelletsEaten = pelletsEaten + 1;
+          set({ pellets: newPellets, score: score + 10, pelletsEaten: newPelletsEaten });
+          
+          // Spawn fruit at certain pellet counts
+          if (newPelletsEaten === 70 || newPelletsEaten === 170) {
+            get().spawnFruit();
+          }
+          
+          // Check if level complete
+          const remainingPellets = newPellets.flat().filter(p => p).length;
+          const remainingPower = get().powerPellets.length;
+          if (remainingPellets === 0 && remainingPower === 0) {
+            set({ gameStatus: 'levelcomplete' });
+          }
+        }
+        
+        // Check power pellet
+        const powerIndex = powerPellets.findIndex(p => p.x === x && p.y === y);
+        if (powerIndex !== -1) {
+          const newPowerPellets = powerPellets.filter((_, i) => i !== powerIndex);
+          const newPelletsEaten = pelletsEaten + 1;
+          set({ powerPellets: newPowerPellets, score: score + 50, pelletsEaten: newPelletsEaten });
+          get().activatePowerPellet();
+          
+          // Check if level complete
+          const remainingPellets = get().pellets.flat().filter(p => p).length;
+          if (remainingPellets === 0 && newPowerPellets.length === 0) {
+            set({ gameStatus: 'levelcomplete' });
+          }
+        }
+        
+        // Check fruit
+        get().eatFruit();
+      },
+
+      spawnFruit: () => {
+        const { level, fruit } = get();
+        if (fruit && fruit.active) return; // Already has active fruit
+        
+        const config = FRUIT_CONFIG[Math.min(level, 12)] || FRUIT_CONFIG[12];
+        set({
+          fruit: {
+            type: config.type,
+            position: { ...FRUIT_POSITION },
+            points: config.points,
+            active: true,
+            expiresAt: get().gameTime + 100, // Active for ~10 seconds
+          }
+        });
+      },
+
+      eatFruit: () => {
+        const { playerPosition, fruit, score } = get();
+        if (!fruit || !fruit.active) return;
+        
+        const dx = Math.abs(playerPosition.x - fruit.position.x);
+        const dy = Math.abs(playerPosition.y - fruit.position.y);
+        
+        if (dx < 1 && dy < 1) {
+          set({ 
+            score: score + fruit.points,
+            fruit: { ...fruit, active: false },
           });
         }
-      }, 1500);
-    }
-  },
+      },
 
-  nextLevel: () => {
-    const { level, score, highScore } = get();
-    set({
-      level: level + 1,
-      pellets: initializePellets(),
-      powerPellets: initializePowerPellets(),
-      playerPosition: { ...PLAYER_START },
-      playerDirection: 'left',
-      ghosts: INITIAL_GHOSTS.map(g => ({ ...g, position: { ...g.position }, mode: 'scatter' })),
-      powerPelletActive: false,
-      powerPelletTimer: 0,
-      gameStatus: 'playing',
-      highScore: Math.max(score, highScore),
-    });
-  },
-}));
+      activatePowerPellet: () => {
+        const { ghosts, level } = get();
+        // Frightened time decreases with level
+        const frightenedTime = Math.max(20, 80 - (level - 1) * 10);
+        
+        const frightenedGhosts = ghosts.map(g => ({
+          ...g,
+          mode: g.mode !== 'eaten' ? 'frightened' as GhostMode : g.mode,
+          // Reverse direction when frightened
+          direction: getOppositeDirection(g.direction),
+        }));
+        set({ 
+          powerPelletActive: true, 
+          powerPelletTimer: frightenedTime,
+          ghosts: frightenedGhosts,
+          ghostsEatenCombo: 0,
+        });
+      },
+
+      decrementPowerTimer: () => {
+        const { powerPelletTimer, ghosts, fruit, gameTime } = get();
+        
+        // Check fruit expiration
+        if (fruit && fruit.active && gameTime >= fruit.expiresAt) {
+          set({ fruit: { ...fruit, active: false } });
+        }
+        
+        if (powerPelletTimer > 0) {
+          const newTimer = powerPelletTimer - 1;
+          if (newTimer === 0) {
+            const normalGhosts = ghosts.map(g => ({
+              ...g,
+              mode: g.mode === 'frightened' ? 'chase' as GhostMode : g.mode,
+            }));
+            set({ powerPelletActive: false, powerPelletTimer: 0, ghosts: normalGhosts, ghostsEatenCombo: 0 });
+          } else {
+            set({ powerPelletTimer: newTimer });
+          }
+        }
+      },
+
+      moveGhosts: () => {
+        const { ghosts, playerPosition, playerDirection, gameStatus, gameTime, level } = get();
+        if (gameStatus !== 'playing') return;
+
+        const newGhosts = ghosts.map(ghost => {
+          // Check if ghost should be released
+          if (ghost.mode === 'scatter' && gameTime < ghost.releaseTime) {
+            // Ghost still in house, just wiggle
+            return ghost;
+          }
+          
+          const directions: Direction[] = ['up', 'down', 'left', 'right'];
+          const opposite = getOppositeDirection(ghost.direction);
+
+          // Get valid directions (not walls, not opposite unless necessary)
+          let validDirections = directions.filter(dir => {
+            if (dir === opposite) return false;
+            const nextPos = getNextPosition(ghost.position, dir);
+            return canGhostMoveTo(nextPos, ghost.mode === 'eaten');
+          });
+
+          if (validDirections.length === 0) {
+            validDirections = directions.filter(dir => {
+              const nextPos = getNextPosition(ghost.position, dir);
+              return canGhostMoveTo(nextPos, ghost.mode === 'eaten');
+            });
+          }
+
+          if (validDirections.length === 0) return ghost;
+
+          let targetDir: Direction;
+          
+          if (ghost.mode === 'frightened') {
+            // Random movement when frightened
+            targetDir = validDirections[Math.floor(Math.random() * validDirections.length)];
+          } else if (ghost.mode === 'eaten') {
+            // Return to ghost house
+            const target = { x: 13, y: 14 };
+            targetDir = getBestDirection(ghost.position, target, validDirections);
+            
+            // Check if reached ghost house
+            if (ghost.position.x === target.x && Math.abs(ghost.position.y - target.y) < 1) {
+              return { ...ghost, mode: 'scatter' as GhostMode, position: { x: 13, y: 14 } };
+            }
+          } else {
+            // Chase or scatter mode with improved AI
+            let target: Position;
+            if (ghost.mode === 'chase') {
+              target = getGhostTarget(ghost, playerPosition, playerDirection, ghosts, level);
+            } else {
+              target = ghost.scatterTarget;
+            }
+            targetDir = getBestDirection(ghost.position, target, validDirections);
+          }
+
+          const newPos = wrapPosition(getNextPosition(ghost.position, targetDir));
+          return { ...ghost, position: newPos, direction: targetDir };
+        });
+
+        set({ ghosts: newGhosts });
+      },
+
+      checkGhostCollision: () => {
+        const { playerPosition, ghosts, score, powerPelletActive, ghostsEatenCombo } = get();
+        
+        for (const ghost of ghosts) {
+          const dx = Math.abs(playerPosition.x - ghost.position.x);
+          const dy = Math.abs(playerPosition.y - ghost.position.y);
+          
+          if (dx < 0.8 && dy < 0.8) {
+            if (ghost.mode === 'frightened') {
+              // Eat ghost - combo scoring (200, 400, 800, 1600)
+              const comboPoints = 200 * Math.pow(2, ghostsEatenCombo);
+              const newGhosts = ghosts.map(g => 
+                g.id === ghost.id ? { ...g, mode: 'eaten' as GhostMode } : g
+              );
+              set({ 
+                ghosts: newGhosts, 
+                score: score + comboPoints,
+                ghostsEatenCombo: ghostsEatenCombo + 1,
+              });
+            } else if (ghost.mode !== 'eaten') {
+              // Player dies
+              get().loseLife();
+            }
+            return;
+          }
+        }
+      },
+
+      loseLife: () => {
+        const { lives, score, highScore } = get();
+        const newHighScore = Math.max(score, highScore);
+        
+        if (lives <= 1) {
+          set({ lives: 0, gameStatus: 'gameover', highScore: newHighScore });
+        } else {
+          set({ 
+            lives: lives - 1, 
+            gameStatus: 'dying',
+            highScore: newHighScore,
+          });
+          // Reset positions after brief pause
+          setTimeout(() => {
+            const state = get();
+            if (state.gameStatus === 'dying') {
+              set({
+                playerPosition: { ...PLAYER_START },
+                playerDirection: 'left',
+                ghosts: createInitialGhosts(),
+                powerPelletActive: false,
+                powerPelletTimer: 0,
+                ghostsEatenCombo: 0,
+                gameStatus: 'playing',
+                gameTime: 0,
+              });
+            }
+          }, 1500);
+        }
+      },
+
+      nextLevel: () => {
+        const { level, score, highScore } = get();
+        set({
+          level: level + 1,
+          pellets: initializePellets(),
+          powerPellets: initializePowerPellets(),
+          pelletsEaten: 0,
+          playerPosition: { ...PLAYER_START },
+          playerDirection: 'left',
+          ghosts: createInitialGhosts(),
+          powerPelletActive: false,
+          powerPelletTimer: 0,
+          ghostsEatenCombo: 0,
+          fruit: null,
+          gameStatus: 'playing',
+          highScore: Math.max(score, highScore),
+          gameTime: 0,
+        });
+      },
+
+      incrementGameTime: () => {
+        set(state => ({ gameTime: state.gameTime + 1 }));
+      },
+
+      toggleSound: () => {
+        set(state => ({ soundEnabled: !state.soundEnabled }));
+      },
+    })
+);
 
 // Helper functions
 function getNextPosition(pos: Position, dir: Direction): Position {
@@ -461,6 +591,16 @@ function getNextPosition(pos: Position, dir: Direction): Position {
     case 'left': return { x: pos.x - 1, y: pos.y };
     case 'right': return { x: pos.x + 1, y: pos.y };
   }
+}
+
+function getOppositeDirection(dir: Direction): Direction {
+  const opposite: Record<Direction, Direction> = {
+    up: 'down',
+    down: 'up',
+    left: 'right',
+    right: 'left',
+  };
+  return opposite[dir];
 }
 
 function wrapPosition(pos: Position): Position {
@@ -480,13 +620,14 @@ function canMoveTo(pos: Position): boolean {
   return cell !== 0 && cell !== 4;
 }
 
-function canGhostMoveTo(pos: Position): boolean {
+function canGhostMoveTo(pos: Position, isEaten: boolean = false): boolean {
   const { x, y } = pos;
   // Allow tunnel
   if (y === 14 && (x < 0 || x >= MAZE_WIDTH)) return true;
   if (x < 0 || x >= MAZE_WIDTH || y < 0 || y >= MAZE_HEIGHT) return false;
   const cell = MAZE_LAYOUT[y][x];
-  return cell !== 0; // Ghosts can enter ghost house
+  if (isEaten) return cell !== 0; // Eaten ghosts can enter ghost house
+  return cell !== 0 && cell !== 4; // Normal ghosts avoid ghost house
 }
 
 function getBestDirection(from: Position, to: Position, validDirections: Direction[]): Direction {
@@ -503,4 +644,73 @@ function getBestDirection(from: Position, to: Position, validDirections: Directi
   }
   
   return bestDir;
+}
+
+// Improved ghost targeting - each ghost has unique behavior
+function getGhostTarget(
+  ghost: Ghost, 
+  playerPos: Position, 
+  playerDir: Direction,
+  allGhosts: Ghost[],
+  level: number
+): Position {
+  switch (ghost.id) {
+    case 'blinky':
+      // Blinky (Shadow) - directly targets player
+      // Gets more aggressive at higher levels
+      return playerPos;
+      
+    case 'pinky':
+      // Pinky (Speedy) - targets 4 tiles ahead of player
+      const offset = 4;
+      let targetX = playerPos.x;
+      let targetY = playerPos.y;
+      switch (playerDir) {
+        case 'up': 
+          targetY -= offset; 
+          targetX -= offset; // Original bug from arcade!
+          break;
+        case 'down': targetY += offset; break;
+        case 'left': targetX -= offset; break;
+        case 'right': targetX += offset; break;
+      }
+      return { x: targetX, y: targetY };
+      
+    case 'inky':
+      // Inky (Bashful) - complex targeting using Blinky's position
+      const blinky = allGhosts.find(g => g.id === 'blinky');
+      if (!blinky) return playerPos;
+      
+      // Get position 2 tiles ahead of player
+      let pivotX = playerPos.x;
+      let pivotY = playerPos.y;
+      switch (playerDir) {
+        case 'up': pivotY -= 2; break;
+        case 'down': pivotY += 2; break;
+        case 'left': pivotX -= 2; break;
+        case 'right': pivotX += 2; break;
+      }
+      
+      // Double the vector from Blinky to pivot
+      return {
+        x: pivotX + (pivotX - blinky.position.x),
+        y: pivotY + (pivotY - blinky.position.y),
+      };
+      
+    case 'sue':
+      // Sue/Clyde (Pokey) - targets player when far, scatters when close
+      const distance = Math.sqrt(
+        Math.pow(ghost.position.x - playerPos.x, 2) + 
+        Math.pow(ghost.position.y - playerPos.y, 2)
+      );
+      // Threshold decreases with level (more aggressive)
+      const threshold = Math.max(4, 8 - level);
+      if (distance > threshold) {
+        return playerPos;
+      }
+      return ghost.scatterTarget;
+      
+    default:
+      return playerPos;
+  }
 }

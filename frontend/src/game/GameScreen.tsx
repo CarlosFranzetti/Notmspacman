@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -8,104 +8,212 @@ import {
   Platform,
 } from 'react-native';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
+import Animated, { 
+  useSharedValue, 
+  useAnimatedStyle, 
+  withTiming,
+  Easing,
+  interpolate,
+  runOnJS,
+} from 'react-native-reanimated';
 import { useGameStore, MAZE_LAYOUT, MAZE_WIDTH, MAZE_HEIGHT, Direction, FruitType } from './store';
 import { Ionicons } from '@expo/vector-icons';
 import { Audio } from 'expo-av';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-// COMPACT PLAYFIELD - larger cells for bigger characters
-const CELL_SIZE = 16;
+// ARCADE-ACCURATE SIZING
+const CELL_SIZE = 14; // Smaller cells for more arcade-like proportions
 const GAME_WIDTH = CELL_SIZE * MAZE_WIDTH;
 const GAME_HEIGHT = CELL_SIZE * MAZE_HEIGHT;
 
-// Scale factor for characters (larger than cell)
-const CHARACTER_SCALE = 1.3;
-const CHARACTER_SIZE = CELL_SIZE * CHARACTER_SCALE;
+// Character sizing - slightly larger than cell for overlap effect
+const CHARACTER_SIZE = CELL_SIZE * 1.4;
+const GHOST_SIZE = CELL_SIZE * 1.35;
 
-// Colors - classic arcade palette
+// Colors - authentic arcade palette
 const COLORS = {
   background: '#000000',
   wall: '#2121DE',
-  pellet: '#FFB897',
-  powerPellet: '#FFB8FF',
+  wallHighlight: '#5555FF',
+  wallShadow: '#0000AA',
+  pellet: '#FCB4AA',
+  powerPellet: '#FCB4AA',
   player: '#FFFF00',
+  playerHighlight: '#FFFFAA',
+  playerShadow: '#CCAA00',
   text: '#FFFFFF',
-  frightened: '#2121DE',
+  frightened: '#2121FF',
+  frightenedFlash: '#FFFFFF',
   eaten: '#FFFFFF',
 };
 
-// Fruit colors
-const FRUIT_COLORS: Record<FruitType, string> = {
-  cherry: '#FF0000',
-  strawberry: '#FF3366',
-  orange: '#FFA500',
-  pretzel: '#8B4513',
-  apple: '#FF0000',
-  pear: '#90EE90',
-  banana: '#FFFF00',
+// Fruit colors with gradients
+const FRUIT_COLORS: Record<FruitType, { main: string; highlight: string }> = {
+  cherry: { main: '#FF0000', highlight: '#FF6666' },
+  strawberry: { main: '#FF3366', highlight: '#FF99AA' },
+  orange: { main: '#FFA500', highlight: '#FFCC66' },
+  pretzel: { main: '#CD853F', highlight: '#DEB887' },
+  apple: { main: '#FF0000', highlight: '#FF6666' },
+  pear: { main: '#90EE90', highlight: '#CCFFCC' },
+  banana: { main: '#FFE135', highlight: '#FFFF99' },
 };
 
-// Frame rate and speed settings
-const BASE_MOVE_INTERVAL = 180;
-const GHOST_MOVE_DELAY = 40;
+// Timing - 60fps arcade accurate
+const FRAME_TIME = 1000 / 60; // ~16.67ms
+const MOVE_FRAMES = 8; // Frames per tile movement (smoother)
+const GHOST_MOVE_FRAMES = 9; // Ghosts slightly slower
 
-// Sound manager
-class SoundManager {
-  private static instance: SoundManager;
+// Sound Manager with synthesized arcade sounds
+class ArcadeSoundManager {
+  private static instance: ArcadeSoundManager;
   private enabled: boolean = true;
-  private chompToggle: boolean = false;
-
-  public static getInstance(): SoundManager {
-    if (!SoundManager.instance) {
-      SoundManager.instance = new SoundManager();
+  private audioContext: AudioContext | null = null;
+  private chompPhase: number = 0;
+  private sirenOscillator: OscillatorNode | null = null;
+  
+  private constructor() {
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      try {
+        this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      } catch (e) {
+        console.log('Web Audio not available');
+      }
     }
-    return SoundManager.instance;
+  }
+
+  public static getInstance(): ArcadeSoundManager {
+    if (!ArcadeSoundManager.instance) {
+      ArcadeSoundManager.instance = new ArcadeSoundManager();
+    }
+    return ArcadeSoundManager.instance;
   }
 
   public setEnabled(enabled: boolean) {
     this.enabled = enabled;
   }
 
-  public async playChomp() {
-    if (!this.enabled) return;
-    this.chompToggle = !this.chompToggle;
-    // Visual feedback instead of actual sound for web compatibility
+  public isEnabled(): boolean {
+    return this.enabled;
   }
 
-  public async playPowerPellet() {
-    if (!this.enabled) return;
+  private playTone(frequency: number, duration: number, type: OscillatorType = 'square', volume: number = 0.1) {
+    if (!this.enabled || !this.audioContext) return;
+    
+    try {
+      const oscillator = this.audioContext.createOscillator();
+      const gainNode = this.audioContext.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(this.audioContext.destination);
+      
+      oscillator.type = type;
+      oscillator.frequency.setValueAtTime(frequency, this.audioContext.currentTime);
+      
+      gainNode.gain.setValueAtTime(volume, this.audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + duration);
+      
+      oscillator.start(this.audioContext.currentTime);
+      oscillator.stop(this.audioContext.currentTime + duration);
+    } catch (e) {
+      // Silently fail
+    }
   }
 
-  public async playGhostEaten() {
-    if (!this.enabled) return;
+  // Waka-waka chomp sound - alternates between two tones
+  public playChomp() {
+    this.chompPhase = 1 - this.chompPhase;
+    const freq = this.chompPhase === 0 ? 261 : 293; // C4 and D4
+    this.playTone(freq, 0.05, 'square', 0.08);
   }
 
-  public async playDeath() {
-    if (!this.enabled) return;
+  // Power pellet - descending arpeggio
+  public playPowerPellet() {
+    const notes = [523, 659, 784, 1047]; // C5, E5, G5, C6
+    notes.forEach((freq, i) => {
+      setTimeout(() => this.playTone(freq, 0.1, 'square', 0.12), i * 50);
+    });
   }
 
-  public async playLevelComplete() {
-    if (!this.enabled) return;
+  // Ghost eaten - rising sweep
+  public playGhostEaten() {
+    if (!this.enabled || !this.audioContext) return;
+    
+    try {
+      const oscillator = this.audioContext.createOscillator();
+      const gainNode = this.audioContext.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(this.audioContext.destination);
+      
+      oscillator.type = 'square';
+      oscillator.frequency.setValueAtTime(200, this.audioContext.currentTime);
+      oscillator.frequency.exponentialRampToValueAtTime(800, this.audioContext.currentTime + 0.2);
+      
+      gainNode.gain.setValueAtTime(0.15, this.audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + 0.3);
+      
+      oscillator.start(this.audioContext.currentTime);
+      oscillator.stop(this.audioContext.currentTime + 0.3);
+    } catch (e) {}
   }
 
-  public async playFruitEaten() {
-    if (!this.enabled) return;
+  // Death sound - descending tones
+  public playDeath() {
+    const notes = [523, 493, 440, 392, 349, 330, 294, 262, 220, 196, 165, 131];
+    notes.forEach((freq, i) => {
+      setTimeout(() => this.playTone(freq, 0.08, 'square', 0.1), i * 80);
+    });
+  }
+
+  // Level complete - victory fanfare
+  public playLevelComplete() {
+    const melody = [523, 659, 784, 1047, 784, 1047];
+    melody.forEach((freq, i) => {
+      setTimeout(() => this.playTone(freq, 0.15, 'square', 0.12), i * 100);
+    });
+  }
+
+  // Fruit eaten - happy blip
+  public playFruitEaten() {
+    this.playTone(880, 0.05, 'square', 0.1);
+    setTimeout(() => this.playTone(1100, 0.08, 'square', 0.1), 60);
+  }
+
+  // Start game jingle
+  public playStartGame() {
+    const notes = [262, 330, 392, 523];
+    notes.forEach((freq, i) => {
+      setTimeout(() => this.playTone(freq, 0.12, 'square', 0.1), i * 120);
+    });
+  }
+
+  // Initialize audio context (must be called from user interaction)
+  public async init() {
+    if (Platform.OS === 'web' && this.audioContext?.state === 'suspended') {
+      await this.audioContext.resume();
+    }
   }
 }
 
-const soundManager = SoundManager.getInstance();
+const soundManager = ArcadeSoundManager.getInstance();
 
 export default function GameScreen() {
+  const frameCount = useRef(0);
+  const lastFrameTime = useRef(0);
   const animationFrame = useRef<number | null>(null);
-  const lastMoveTime = useRef<number>(0);
-  const lastGhostMoveTime = useRef<number>(0);
-  const lastAnimTime = useRef<number>(0);
+  const moveCounter = useRef(0);
+  const ghostMoveCounter = useRef(0);
   const modeTimer = useRef<NodeJS.Timeout | null>(null);
   
-  const [mouthOpen, setMouthOpen] = useState(true);
+  // Animation states
+  const [mouthAngle, setMouthAngle] = useState(0);
   const [powerFlash, setPowerFlash] = useState(false);
-  const [showPoints, setShowPoints] = useState<{x: number, y: number, points: number} | null>(null);
+  const [ghostWiggle, setGhostWiggle] = useState(0);
+  
+  // Smooth position interpolation for player - initialize with default position
+  const playerX = useSharedValue(13 * CELL_SIZE);
+  const playerY = useSharedValue(23 * CELL_SIZE);
 
   const {
     playerPosition,
@@ -122,7 +230,6 @@ export default function GameScreen() {
     ghosts,
     ghostsEatenCombo,
     gameStatus,
-    gameTime,
     soundEnabled,
     startGame,
     pauseGame,
@@ -136,52 +243,85 @@ export default function GameScreen() {
     decrementPowerTimer,
     nextLevel,
     incrementGameTime,
-    toggleSound,
   } = useGameStore();
 
-  // Calculate speed based on level
-  const getMoveInterval = useCallback(() => {
-    const speedMultiplier = Math.max(0.5, 1 - (level - 1) * 0.06);
-    return BASE_MOVE_INTERVAL * speedMultiplier;
+  // Initialize ghost position shared values - NOT using hooks in map
+  // Ghost positions will be calculated directly without shared values for now
+
+  // Sync player position with smooth animation
+  useEffect(() => {
+    const targetX = playerPosition.x * CELL_SIZE;
+    const targetY = playerPosition.y * CELL_SIZE;
+    
+    playerX.value = withTiming(targetX, {
+      duration: FRAME_TIME * MOVE_FRAMES,
+      easing: Easing.linear,
+    });
+    playerY.value = withTiming(targetY, {
+      duration: FRAME_TIME * MOVE_FRAMES,
+      easing: Easing.linear,
+    });
+  }, [playerPosition.x, playerPosition.y]);
+
+  // Ghost positions will be animated via state changes
+
+  // Calculate move speed based on level
+  const getMoveFrames = useCallback(() => {
+    // Speed up slightly each level
+    return Math.max(5, MOVE_FRAMES - Math.floor((level - 1) * 0.5));
   }, [level]);
 
-  // High frame rate game loop
+  // Main game loop - 60fps
   useEffect(() => {
     if (gameStatus !== 'playing') return;
 
     let running = true;
-    const moveInterval = getMoveInterval();
-    const ghostMoveInterval = moveInterval + GHOST_MOVE_DELAY;
+    const moveFrames = getMoveFrames();
+    const ghostMoveFrames = moveFrames + 1;
 
-    const gameLoop = () => {
+    const gameLoop = (timestamp: number) => {
       if (!running) return;
 
-      const now = Date.now();
-
-      // Player movement
-      if (now - lastMoveTime.current >= moveInterval) {
-        movePlayer();
-        eatPellet();
-        checkGhostCollision();
-        lastMoveTime.current = now;
-      }
-
-      // Ghost movement
-      if (now - lastGhostMoveTime.current >= ghostMoveInterval) {
-        moveGhosts();
-        checkGhostCollision();
-        decrementPowerTimer();
-        incrementGameTime();
-        lastGhostMoveTime.current = now;
-      }
-
-      // Animation updates
-      if (now - lastAnimTime.current >= 80) {
-        setMouthOpen(m => !m);
-        if (powerPelletActive) {
+      const deltaTime = timestamp - lastFrameTime.current;
+      
+      if (deltaTime >= FRAME_TIME) {
+        frameCount.current++;
+        lastFrameTime.current = timestamp;
+        
+        // Mouth animation (8 frames per cycle)
+        const mouthCycle = frameCount.current % 8;
+        setMouthAngle(Math.sin(mouthCycle / 8 * Math.PI * 2) * 45);
+        
+        // Ghost wiggle animation
+        setGhostWiggle(Math.sin(frameCount.current / 4) * 2);
+        
+        // Power pellet flash
+        if (powerPelletActive && frameCount.current % 8 === 0) {
           setPowerFlash(f => !f);
         }
-        lastAnimTime.current = now;
+        
+        // Player movement
+        moveCounter.current++;
+        if (moveCounter.current >= moveFrames) {
+          moveCounter.current = 0;
+          movePlayer();
+          eatPellet();
+          checkGhostCollision();
+          
+          // Play chomp sound when eating
+          const { pellets: currentPellets } = useGameStore.getState();
+          soundManager.playChomp();
+        }
+        
+        // Ghost movement
+        ghostMoveCounter.current++;
+        if (ghostMoveCounter.current >= ghostMoveFrames) {
+          ghostMoveCounter.current = 0;
+          moveGhosts();
+          checkGhostCollision();
+          decrementPowerTimer();
+          incrementGameTime();
+        }
       }
 
       animationFrame.current = requestAnimationFrame(gameLoop);
@@ -191,8 +331,8 @@ export default function GameScreen() {
 
     // Mode switching timer
     modeTimer.current = setInterval(() => {
-      const { ghosts } = useGameStore.getState();
-      const newGhosts = ghosts.map(g => ({
+      const state = useGameStore.getState();
+      const newGhosts = state.ghosts.map(g => ({
         ...g,
         mode: g.mode === 'scatter' ? 'chase' : 
               g.mode === 'chase' ? 'scatter' : 
@@ -212,12 +352,14 @@ export default function GameScreen() {
     };
   }, [gameStatus, level, powerPelletActive]);
 
-  // Reset timers when game starts
+  // Reset counters when game starts
   useEffect(() => {
     if (gameStatus === 'playing') {
-      lastMoveTime.current = Date.now();
-      lastGhostMoveTime.current = Date.now();
-      lastAnimTime.current = Date.now();
+      frameCount.current = 0;
+      moveCounter.current = 0;
+      ghostMoveCounter.current = 0;
+      lastFrameTime.current = performance.now();
+      soundManager.playStartGame();
     }
   }, [gameStatus]);
 
@@ -232,21 +374,16 @@ export default function GameScreen() {
       const { translationX, translationY } = event;
       
       if (Math.abs(translationX) > Math.abs(translationY)) {
-        if (translationX > 15) {
-          setDirection('right');
-        } else if (translationX < -15) {
-          setDirection('left');
-        }
+        if (translationX > 10) setDirection('right');
+        else if (translationX < -10) setDirection('left');
       } else {
-        if (translationY > 15) {
-          setDirection('down');
-        } else if (translationY < -15) {
-          setDirection('up');
-        }
+        if (translationY > 10) setDirection('down');
+        else if (translationY < -10) setDirection('up');
       }
     });
 
-  const renderMaze = () => {
+  // Render maze with pixel-art shading
+  const renderMaze = useMemo(() => {
     const cells = [];
     
     for (let y = 0; y < MAZE_HEIGHT; y++) {
@@ -255,44 +392,243 @@ export default function GameScreen() {
         const hasPellet = pellets[y] && pellets[y][x];
         const hasPowerPellet = powerPellets.some(p => p.x === x && p.y === y);
         
-        cells.push(
-          <View
-            key={`${x}-${y}`}
-            style={[
-              styles.cell,
-              {
-                left: x * CELL_SIZE,
-                top: y * CELL_SIZE,
-                width: CELL_SIZE,
-                height: CELL_SIZE,
-                backgroundColor: cell === 0 ? COLORS.wall : COLORS.background,
-                borderRadius: cell === 0 ? 3 : 0,
-              },
-            ]}
-          >
-            {hasPellet && (
-              <View style={styles.pellet} />
-            )}
-            {hasPowerPellet && (
-              <View style={[
-                styles.powerPellet, 
-                powerFlash && styles.powerPelletFlash,
-                { transform: [{ scale: powerFlash ? 0.7 : 1 }] }
-              ]} />
-            )}
-          </View>
-        );
+        if (cell === 0) {
+          // Wall with pixel shading
+          cells.push(
+            <View
+              key={`wall-${x}-${y}`}
+              style={[
+                styles.cell,
+                styles.wallCell,
+                {
+                  left: x * CELL_SIZE,
+                  top: y * CELL_SIZE,
+                  width: CELL_SIZE,
+                  height: CELL_SIZE,
+                },
+              ]}
+            >
+              {/* Highlight edge */}
+              <View style={styles.wallHighlight} />
+              {/* Shadow edge */}
+              <View style={styles.wallShadow} />
+            </View>
+          );
+        } else {
+          // Path cell
+          cells.push(
+            <View
+              key={`path-${x}-${y}`}
+              style={[
+                styles.cell,
+                {
+                  left: x * CELL_SIZE,
+                  top: y * CELL_SIZE,
+                  width: CELL_SIZE,
+                  height: CELL_SIZE,
+                  backgroundColor: COLORS.background,
+                },
+              ]}
+            >
+              {hasPellet && (
+                <View style={styles.pellet}>
+                  <View style={styles.pelletHighlight} />
+                </View>
+              )}
+              {hasPowerPellet && (
+                <Animated.View 
+                  style={[
+                    styles.powerPellet,
+                    { opacity: powerFlash ? 0.3 : 1 }
+                  ]}
+                >
+                  <View style={styles.powerPelletHighlight} />
+                </Animated.View>
+              )}
+            </View>
+          );
+        }
       }
     }
     
     return cells;
+  }, [pellets, powerPellets, powerFlash]);
+
+  // Animated player style
+  const playerAnimatedStyle = useAnimatedStyle(() => {
+    const offset = (CHARACTER_SIZE - CELL_SIZE) / 2;
+    return {
+      left: playerX.value - offset,
+      top: playerY.value - offset,
+    };
+  });
+
+  // Render Ms. Pac-Man with pixel-art details
+  const renderPlayer = () => {
+    const rotation = {
+      right: 0,
+      left: 180,
+      up: -90,
+      down: 90,
+    }[playerDirection];
+
+    return (
+      <Animated.View
+        style={[
+          styles.player,
+          playerAnimatedStyle,
+          {
+            width: CHARACTER_SIZE,
+            height: CHARACTER_SIZE,
+            transform: [{ rotate: `${rotation}deg` }],
+          },
+        ]}
+      >
+        {/* Main body */}
+        <View style={styles.pacmanBody}>
+          {/* Highlight */}
+          <View style={styles.pacmanHighlight} />
+          
+          {/* Mouth */}
+          <View 
+            style={[
+              styles.pacmanMouth,
+              { 
+                height: `${30 + Math.abs(mouthAngle)}%`,
+                top: `${35 - Math.abs(mouthAngle) / 2}%`,
+              }
+            ]} 
+          />
+          
+          {/* Eye */}
+          <View style={styles.pacmanEye} />
+          
+          {/* Bow (Ms. feature) */}
+          <View style={styles.pacmanBow}>
+            <View style={styles.bowLeft} />
+            <View style={styles.bowRight} />
+            <View style={styles.bowCenter} />
+          </View>
+          
+          {/* Beauty mark */}
+          <View style={styles.pacmanBeautyMark} />
+        </View>
+      </Animated.View>
+    );
   };
 
+  // Render ghosts with pixel-art details
+  const renderGhosts = () => {
+    return ghosts.map((ghost, index) => {
+      const isFrightened = ghost.mode === 'frightened';
+      const isEaten = ghost.mode === 'eaten';
+      const flashWhite = isFrightened && powerPelletTimer < 20 && powerFlash;
+      
+      const offset = (GHOST_SIZE - CELL_SIZE) / 2;
+      
+      // Get eye direction based on ghost movement
+      const eyeOffsetX = ghost.direction === 'left' ? -2 : ghost.direction === 'right' ? 2 : 0;
+      const eyeOffsetY = ghost.direction === 'up' ? -2 : ghost.direction === 'down' ? 2 : 0;
+      
+      const ghostStyle = {
+        left: ghost.position.x * CELL_SIZE - offset,
+        top: ghost.position.y * CELL_SIZE - offset + ghostWiggle,
+        width: GHOST_SIZE,
+        height: GHOST_SIZE,
+      };
+      
+      return (
+        <View key={ghost.id} style={[styles.ghost, ghostStyle]}>
+          {isEaten ? (
+            // Just eyes when eaten
+            <View style={styles.ghostEyesOnly}>
+              <View style={styles.eatenEye}>
+                <View style={[styles.eatenPupil, { marginLeft: eyeOffsetX, marginTop: eyeOffsetY }]} />
+              </View>
+              <View style={styles.eatenEye}>
+                <View style={[styles.eatenPupil, { marginLeft: eyeOffsetX, marginTop: eyeOffsetY }]} />
+              </View>
+            </View>
+          ) : (
+            <View
+              style={[
+                styles.ghostBody,
+                { 
+                  backgroundColor: isFrightened 
+                    ? (flashWhite ? COLORS.frightenedFlash : COLORS.frightened) 
+                    : ghost.color 
+                },
+              ]}
+            >
+              {/* Ghost highlight */}
+              <View style={[styles.ghostHighlight, isFrightened && { backgroundColor: 'rgba(100, 100, 255, 0.5)' }]} />
+              
+              {/* Eyes */}
+              <View style={styles.ghostEyes}>
+                {isFrightened ? (
+                  // Frightened eyes
+                  <>
+                    <View style={styles.frightenedEye} />
+                    <View style={styles.frightenedEye} />
+                  </>
+                ) : (
+                  // Normal eyes
+                  <>
+                    <View style={styles.ghostEyeWhite}>
+                      <View style={[styles.ghostPupil, { marginLeft: eyeOffsetX, marginTop: eyeOffsetY }]} />
+                    </View>
+                    <View style={styles.ghostEyeWhite}>
+                      <View style={[styles.ghostPupil, { marginLeft: eyeOffsetX, marginTop: eyeOffsetY }]} />
+                    </View>
+                  </>
+                )}
+              </View>
+              
+              {/* Frightened mouth */}
+              {isFrightened && (
+                <View style={styles.frightenedMouthContainer}>
+                  {[0, 1, 2, 3, 4].map(i => (
+                    <View 
+                      key={i} 
+                      style={[
+                        styles.frightenedMouthSegment,
+                        { backgroundColor: flashWhite ? COLORS.frightened : COLORS.frightenedFlash }
+                      ]} 
+                    />
+                  ))}
+                </View>
+              )}
+              
+              {/* Wavy bottom */}
+              <View style={styles.ghostSkirt}>
+                {[0, 1, 2, 3].map(i => (
+                  <View 
+                    key={i}
+                    style={[
+                      styles.ghostWave,
+                      { 
+                        backgroundColor: isFrightened 
+                          ? (flashWhite ? COLORS.frightenedFlash : COLORS.frightened)
+                          : ghost.color,
+                        marginTop: (i + frameCount.current / 4) % 2 === 0 ? 0 : -2,
+                      }
+                    ]} 
+                  />
+                ))}
+              </View>
+            </View>
+          )}
+        </View>
+      );
+    });
+  };
+
+  // Render fruit with pixel-art style
   const renderFruit = () => {
     if (!fruit || !fruit.active) return null;
     
     const offset = (CHARACTER_SIZE - CELL_SIZE) / 2;
-    const fruitColor = FRUIT_COLORS[fruit.type];
+    const colors = FRUIT_COLORS[fruit.type];
     
     return (
       <View
@@ -308,142 +644,33 @@ export default function GameScreen() {
       >
         {fruit.type === 'cherry' && (
           <View style={styles.cherryContainer}>
-            <View style={[styles.cherry, { backgroundColor: fruitColor }]} />
-            <View style={[styles.cherry, { backgroundColor: fruitColor, marginLeft: -4 }]} />
+            <View style={[styles.cherry, { backgroundColor: colors.main }]}>
+              <View style={[styles.cherryHighlight, { backgroundColor: colors.highlight }]} />
+            </View>
+            <View style={[styles.cherry, { backgroundColor: colors.main, marginLeft: -3 }]}>
+              <View style={[styles.cherryHighlight, { backgroundColor: colors.highlight }]} />
+            </View>
             <View style={styles.cherryStem} />
+            <View style={styles.cherryLeaf} />
           </View>
         )}
         {fruit.type === 'strawberry' && (
-          <View style={[styles.strawberry, { backgroundColor: fruitColor }]}>
-            <View style={styles.strawberryLeaf} />
+          <View style={[styles.strawberry, { backgroundColor: colors.main }]}>
+            <View style={[styles.strawberryHighlight, { backgroundColor: colors.highlight }]} />
+            <View style={styles.strawberryLeaves} />
             <View style={styles.strawberrySeed} />
-            <View style={[styles.strawberrySeed, { left: '60%' }]} />
+            <View style={[styles.strawberrySeed, { left: '55%', top: '50%' }]} />
+            <View style={[styles.strawberrySeed, { left: '35%', top: '65%' }]} />
           </View>
         )}
         {fruit.type === 'orange' && (
-          <View style={[styles.orange, { backgroundColor: fruitColor }]}>
-            <View style={styles.orangeLeaf} />
+          <View style={[styles.orange, { backgroundColor: colors.main }]}>
+            <View style={[styles.orangeHighlight, { backgroundColor: colors.highlight }]} />
+            <View style={styles.orangeStem} />
           </View>
-        )}
-        {fruit.type === 'pretzel' && (
-          <View style={[styles.pretzel, { borderColor: fruitColor }]} />
-        )}
-        {fruit.type === 'apple' && (
-          <View style={[styles.apple, { backgroundColor: fruitColor }]}>
-            <View style={styles.appleStem} />
-            <View style={styles.appleLeaf} />
-          </View>
-        )}
-        {fruit.type === 'pear' && (
-          <View style={[styles.pear, { backgroundColor: fruitColor }]} />
-        )}
-        {fruit.type === 'banana' && (
-          <View style={[styles.banana, { backgroundColor: fruitColor }]} />
         )}
       </View>
     );
-  };
-
-  const renderPlayer = () => {
-    const rotation = {
-      right: '0deg',
-      left: '180deg',
-      up: '-90deg',
-      down: '90deg',
-    }[playerDirection];
-
-    const offset = (CHARACTER_SIZE - CELL_SIZE) / 2;
-
-    return (
-      <View
-        style={[
-          styles.player,
-          {
-            left: playerPosition.x * CELL_SIZE - offset,
-            top: playerPosition.y * CELL_SIZE - offset,
-            width: CHARACTER_SIZE,
-            height: CHARACTER_SIZE,
-            transform: [{ rotate: rotation }],
-          },
-        ]}
-      >
-        <View style={styles.pacmanBody}>
-          {mouthOpen && <View style={styles.pacmanMouth} />}
-          <View style={styles.pacmanBow} />
-          <View style={styles.pacmanBeautyMark} />
-        </View>
-      </View>
-    );
-  };
-
-  const renderGhosts = () => {
-    const offset = (CHARACTER_SIZE - CELL_SIZE) / 2;
-    
-    return ghosts.map(ghost => {
-      const isFrightened = ghost.mode === 'frightened';
-      const isEaten = ghost.mode === 'eaten';
-      const flashWhite = isFrightened && powerPelletTimer < 20 && powerFlash;
-      
-      return (
-        <View
-          key={ghost.id}
-          style={[
-            styles.ghost,
-            {
-              left: ghost.position.x * CELL_SIZE - offset,
-              top: ghost.position.y * CELL_SIZE - offset,
-              width: CHARACTER_SIZE,
-              height: CHARACTER_SIZE,
-            },
-          ]}
-        >
-          {isEaten ? (
-            <View style={styles.ghostEyesOnly}>
-              <View style={styles.ghostEyeWhiteLarge}>
-                <View style={styles.ghostEyePupilLarge} />
-              </View>
-              <View style={styles.ghostEyeWhiteLarge}>
-                <View style={styles.ghostEyePupilLarge} />
-              </View>
-            </View>
-          ) : (
-            <View
-              style={[
-                styles.ghostBody,
-                { 
-                  backgroundColor: isFrightened 
-                    ? (flashWhite ? '#FFFFFF' : COLORS.frightened) 
-                    : ghost.color 
-                },
-              ]}
-            >
-              <View style={styles.ghostEyes}>
-                <View style={[styles.ghostEyeWhite, isFrightened && styles.frightenedEye]}>
-                  {!isFrightened && <View style={styles.ghostEyePupil} />}
-                </View>
-                <View style={[styles.ghostEyeWhite, isFrightened && styles.frightenedEye]}>
-                  {!isFrightened && <View style={styles.ghostEyePupil} />}
-                </View>
-              </View>
-              {isFrightened && (
-                <View style={styles.frightenedMouth}>
-                  <View style={styles.frightenedTooth} />
-                  <View style={styles.frightenedTooth} />
-                  <View style={styles.frightenedTooth} />
-                </View>
-              )}
-              <View style={styles.ghostSkirt}>
-                <View style={[styles.ghostLeg, { backgroundColor: isFrightened ? (flashWhite ? '#FFFFFF' : COLORS.frightened) : ghost.color }]} />
-                <View style={styles.ghostLegGap} />
-                <View style={[styles.ghostLeg, { backgroundColor: isFrightened ? (flashWhite ? '#FFFFFF' : COLORS.frightened) : ghost.color }]} />
-                <View style={styles.ghostLegGap} />
-                <View style={[styles.ghostLeg, { backgroundColor: isFrightened ? (flashWhite ? '#FFFFFF' : COLORS.frightened) : ghost.color }]} />
-              </View>
-            </View>
-          )}
-        </View>
-      );
-    });
   };
 
   const renderControls = () => (
@@ -454,7 +681,9 @@ export default function GameScreen() {
           onPress={() => setDirection('up')}
           activeOpacity={0.7}
         >
-          <Ionicons name="caret-up" size={36} color={COLORS.text} />
+          <View style={styles.dpadArrow}>
+            <View style={[styles.dpadTriangle, { transform: [{ rotate: '0deg' }] }]} />
+          </View>
         </TouchableOpacity>
       </View>
       <View style={styles.controlRow}>
@@ -463,15 +692,19 @@ export default function GameScreen() {
           onPress={() => setDirection('left')}
           activeOpacity={0.7}
         >
-          <Ionicons name="caret-back" size={36} color={COLORS.text} />
+          <View style={styles.dpadArrow}>
+            <View style={[styles.dpadTriangle, { transform: [{ rotate: '-90deg' }] }]} />
+          </View>
         </TouchableOpacity>
-        <View style={styles.controlSpacer} />
+        <View style={styles.controlCenter} />
         <TouchableOpacity 
           style={styles.controlButton}
           onPress={() => setDirection('right')}
           activeOpacity={0.7}
         >
-          <Ionicons name="caret-forward" size={36} color={COLORS.text} />
+          <View style={styles.dpadArrow}>
+            <View style={[styles.dpadTriangle, { transform: [{ rotate: '90deg' }] }]} />
+          </View>
         </TouchableOpacity>
       </View>
       <View style={styles.controlRow}>
@@ -480,7 +713,9 @@ export default function GameScreen() {
           onPress={() => setDirection('down')}
           activeOpacity={0.7}
         >
-          <Ionicons name="caret-down" size={36} color={COLORS.text} />
+          <View style={styles.dpadArrow}>
+            <View style={[styles.dpadTriangle, { transform: [{ rotate: '180deg' }] }]} />
+          </View>
         </TouchableOpacity>
       </View>
     </View>
@@ -491,14 +726,19 @@ export default function GameScreen() {
     for (let i = 0; i < lives; i++) {
       lifeIcons.push(
         <View key={i} style={styles.lifeIcon}>
-          <View style={styles.lifeIconBody}>
-            <View style={styles.lifeIconMouth} />
-            <View style={styles.lifeIconBow} />
+          <View style={styles.lifePacman}>
+            <View style={styles.lifeMouth} />
+            <View style={styles.lifeBow} />
           </View>
         </View>
       );
     }
     return <View style={styles.livesContainer}>{lifeIcons}</View>;
+  };
+
+  const handleStartGame = async () => {
+    await soundManager.init();
+    startGame();
   };
 
   const renderOverlay = () => {
@@ -512,21 +752,26 @@ export default function GameScreen() {
             {ghosts.map(ghost => (
               <View key={ghost.id} style={styles.ghostIntroItem}>
                 <View style={[styles.miniGhost, { backgroundColor: ghost.color }]}>
+                  <View style={styles.miniGhostHighlight} />
                   <View style={styles.miniGhostEyes}>
-                    <View style={styles.miniGhostEye} />
-                    <View style={styles.miniGhostEye} />
+                    <View style={styles.miniGhostEye}>
+                      <View style={styles.miniGhostPupil} />
+                    </View>
+                    <View style={styles.miniGhostEye}>
+                      <View style={styles.miniGhostPupil} />
+                    </View>
                   </View>
                 </View>
                 <Text style={styles.ghostName}>{ghost.name}</Text>
               </View>
             ))}
           </View>
-          <TouchableOpacity style={styles.startButton} onPress={startGame}>
+          <TouchableOpacity style={styles.startButton} onPress={handleStartGame}>
             <Text style={styles.startButtonText}>START GAME</Text>
           </TouchableOpacity>
-          <Text style={styles.instructionText}>Swipe or use arrows to move</Text>
+          <Text style={styles.instructionText}>Swipe or use D-pad to move</Text>
           {highScore > 0 && (
-            <Text style={styles.highScoreReadyText}>High Score: {highScore}</Text>
+            <Text style={styles.highScoreReadyText}>HIGH SCORE: {highScore}</Text>
           )}
         </View>
       );
@@ -539,22 +784,22 @@ export default function GameScreen() {
           <TouchableOpacity style={styles.startButton} onPress={resumeGame}>
             <Text style={styles.startButtonText}>RESUME</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryButton} onPress={resetGame}>
-            <Text style={styles.secondaryButtonText}>QUIT</Text>
+          <TouchableOpacity style={styles.quitButton} onPress={resetGame}>
+            <Text style={styles.quitButtonText}>QUIT</Text>
           </TouchableOpacity>
         </View>
       );
     }
 
     if (gameStatus === 'gameover') {
+      soundManager.playDeath();
       return (
         <View style={styles.overlay}>
           <Text style={styles.gameOverText}>GAME OVER</Text>
-          <Text style={styles.finalScoreText}>Score: {score}</Text>
+          <Text style={styles.finalScoreText}>{score.toString().padStart(6, '0')}</Text>
           {score >= highScore && score > 0 && (
             <Text style={styles.newHighScoreText}>NEW HIGH SCORE!</Text>
           )}
-          <Text style={styles.highScoreOverlayText}>High Score: {Math.max(score, highScore)}</Text>
           <TouchableOpacity style={styles.startButton} onPress={resetGame}>
             <Text style={styles.startButtonText}>PLAY AGAIN</Text>
           </TouchableOpacity>
@@ -563,12 +808,12 @@ export default function GameScreen() {
     }
 
     if (gameStatus === 'levelcomplete') {
+      soundManager.playLevelComplete();
       return (
         <View style={styles.overlay}>
           <Text style={styles.levelCompleteText}>LEVEL {level}</Text>
           <Text style={styles.levelCompleteSubtext}>COMPLETE!</Text>
-          <Text style={styles.finalScoreText}>Score: {score}</Text>
-          <Text style={styles.bonusText}>Speed Up!</Text>
+          <Text style={styles.finalScoreText}>{score.toString().padStart(6, '0')}</Text>
           <TouchableOpacity style={styles.startButton} onPress={nextLevel}>
             <Text style={styles.startButtonText}>NEXT LEVEL</Text>
           </TouchableOpacity>
@@ -578,78 +823,72 @@ export default function GameScreen() {
 
     if (gameStatus === 'dying') {
       return (
-        <View style={styles.dyingOverlay}>
-          <Text style={styles.dyingText}>OUCH!</Text>
-        </View>
+        <View style={styles.dyingOverlay} />
       );
     }
 
     return null;
   };
 
-  // Combo points display
-  const getComboPoints = () => {
-    if (ghostsEatenCombo > 0 && powerPelletActive) {
-      return 200 * Math.pow(2, ghostsEatenCombo - 1);
-    }
-    return null;
-  };
-
   return (
     <View style={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
-        <View style={styles.scoreContainer}>
-          <Text style={styles.scoreLabel}>SCORE</Text>
-          <Text style={styles.scoreValue}>{score.toString().padStart(6, '0')}</Text>
-        </View>
-        <View style={styles.levelContainer}>
-          <Text style={styles.levelLabel}>LEVEL</Text>
-          <Text style={styles.levelValue}>{level}</Text>
-        </View>
-        <View style={styles.highScoreContainer}>
-          <Text style={styles.scoreLabel}>HIGH</Text>
-          <Text style={styles.highScoreValue}>{Math.max(score, highScore).toString().padStart(6, '0')}</Text>
+      {/* Arcade cabinet top */}
+      <View style={styles.cabinetTop}>
+        <View style={styles.scorePanel}>
+          <View style={styles.scoreSection}>
+            <Text style={styles.scoreLabel}>1UP</Text>
+            <Text style={styles.scoreValue}>{score.toString().padStart(6, '0')}</Text>
+          </View>
+          <View style={styles.scoreSection}>
+            <Text style={styles.scoreLabel}>HIGH SCORE</Text>
+            <Text style={styles.highScoreValue}>{Math.max(score, highScore).toString().padStart(6, '0')}</Text>
+          </View>
+          <View style={styles.scoreSection}>
+            <Text style={styles.scoreLabel}>LEVEL</Text>
+            <Text style={styles.levelValue}>{level}</Text>
+          </View>
         </View>
       </View>
 
-      {/* Lives and Pause */}
+      {/* Lives and fruit display */}
       <View style={styles.infoBar}>
         {renderLives()}
-        <View style={styles.infoBarRight}>
+        <View style={styles.infoRight}>
           {fruit && fruit.active && (
-            <View style={[styles.fruitIndicator, { backgroundColor: FRUIT_COLORS[fruit.type] }]} />
+            <View style={[styles.fruitIndicator, { backgroundColor: FRUIT_COLORS[fruit.type].main }]} />
           )}
           {gameStatus === 'playing' && (
-            <TouchableOpacity onPress={pauseGame} style={styles.pauseButton}>
-              <Ionicons name="pause-circle" size={32} color={COLORS.text} />
+            <TouchableOpacity onPress={pauseGame} style={styles.pauseBtn}>
+              <Text style={styles.pauseBtnText}>II</Text>
             </TouchableOpacity>
           )}
         </View>
       </View>
 
-      {/* Game Area */}
+      {/* Game Area with CRT effect border */}
       <GestureDetector gesture={panGesture}>
-        <View style={[styles.gameContainer, { width: GAME_WIDTH, height: GAME_HEIGHT }]}>
-          {renderMaze()}
-          {renderFruit()}
-          {gameStatus !== 'ready' && gameStatus !== 'gameover' && renderPlayer()}
-          {gameStatus !== 'ready' && gameStatus !== 'gameover' && renderGhosts()}
-          {renderOverlay()}
+        <View style={styles.crtBorder}>
+          <View style={[styles.gameContainer, { width: GAME_WIDTH, height: GAME_HEIGHT }]}>
+            {renderMaze}
+            {renderFruit()}
+            {gameStatus !== 'ready' && gameStatus !== 'gameover' && renderPlayer()}
+            {gameStatus !== 'ready' && gameStatus !== 'gameover' && renderGhosts()}
+            {renderOverlay()}
+          </View>
         </View>
       </GestureDetector>
 
-      {/* Controls */}
+      {/* D-Pad Controls */}
       {gameStatus === 'playing' && renderControls()}
       
-      {/* Power pellet status */}
+      {/* Power mode indicator */}
       {powerPelletActive && gameStatus === 'playing' && (
-        <View style={styles.powerStatus}>
-          <Text style={[styles.powerStatusText, powerFlash && { opacity: 0.5 }]}>
-            POWER MODE {Math.ceil(powerPelletTimer / 10)}s
+        <View style={styles.powerIndicator}>
+          <Text style={[styles.powerText, powerFlash && { opacity: 0.5 }]}>
+            POWER! {Math.ceil(powerPelletTimer / 6)}
           </Text>
-          {getComboPoints() && (
-            <Text style={styles.comboText}>x{ghostsEatenCombo} = {getComboPoints()}</Text>
+          {ghostsEatenCombo > 0 && (
+            <Text style={styles.comboText}>{200 * Math.pow(2, ghostsEatenCombo - 1)} PTS</Text>
           )}
         </View>
       )}
@@ -660,65 +899,58 @@ export default function GameScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: COLORS.background,
+    backgroundColor: '#1a1a2e',
     alignItems: 'center',
-    paddingTop: Platform.OS === 'ios' ? 50 : 30,
+    paddingTop: Platform.OS === 'ios' ? 45 : 25,
   },
-  header: {
+  cabinetTop: {
+    width: GAME_WIDTH + 20,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    backgroundColor: '#0f0f1a',
+    borderRadius: 8,
+    marginBottom: 5,
+  },
+  scorePanel: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    width: GAME_WIDTH,
-    marginBottom: 8,
-    paddingHorizontal: 5,
   },
-  scoreContainer: {
-    alignItems: 'flex-start',
-  },
-  levelContainer: {
+  scoreSection: {
     alignItems: 'center',
   },
-  highScoreContainer: {
-    alignItems: 'flex-end',
-  },
   scoreLabel: {
-    color: COLORS.text,
-    fontSize: 10,
+    color: '#FFFFFF',
+    fontSize: 8,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    letterSpacing: 1,
+    fontWeight: 'bold',
   },
   scoreValue: {
-    color: COLORS.text,
-    fontSize: 16,
-    fontWeight: 'bold',
+    color: '#FFFFFF',
+    fontSize: 14,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontWeight: 'bold',
   },
   highScoreValue: {
-    color: '#FFB8FF',
-    fontSize: 16,
+    color: '#FF69B4',
+    fontSize: 14,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
     fontWeight: 'bold',
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-  },
-  levelLabel: {
-    color: COLORS.text,
-    fontSize: 10,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    letterSpacing: 1,
   },
   levelValue: {
     color: '#00FFFF',
-    fontSize: 18,
-    fontWeight: 'bold',
+    fontSize: 14,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontWeight: 'bold',
   },
   infoBar: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    width: GAME_WIDTH,
-    marginBottom: 8,
-    paddingHorizontal: 5,
+    width: GAME_WIDTH + 20,
+    paddingHorizontal: 10,
+    marginBottom: 5,
   },
-  infoBarRight: {
+  infoRight: {
     flexDirection: 'row',
     alignItems: 'center',
   },
@@ -726,180 +958,123 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
   },
   lifeIcon: {
-    width: 22,
-    height: 22,
-    marginRight: 4,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  lifeIconBody: {
     width: 18,
     height: 18,
+    marginRight: 3,
+  },
+  lifePacman: {
+    width: 16,
+    height: 16,
     backgroundColor: COLORS.player,
-    borderRadius: 9,
-    position: 'relative',
+    borderRadius: 8,
     overflow: 'hidden',
   },
-  lifeIconMouth: {
+  lifeMouth: {
     position: 'absolute',
     right: -2,
     top: 4,
-    width: 10,
-    height: 10,
-    backgroundColor: COLORS.background,
+    width: 8,
+    height: 8,
+    backgroundColor: '#1a1a2e',
     transform: [{ rotate: '45deg' }],
   },
-  lifeIconBow: {
+  lifeBow: {
     position: 'absolute',
     top: -2,
-    left: 5,
+    left: 4,
     width: 6,
     height: 4,
     backgroundColor: '#FF0000',
     borderRadius: 2,
   },
   fruitIndicator: {
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    marginRight: 10,
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    marginRight: 8,
   },
-  pauseButton: {
-    padding: 2,
+  pauseBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    backgroundColor: '#333',
+    borderRadius: 4,
+  },
+  pauseBtnText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  crtBorder: {
+    padding: 4,
+    backgroundColor: '#0a0a14',
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#333',
   },
   gameContainer: {
     position: 'relative',
     backgroundColor: COLORS.background,
     overflow: 'hidden',
-    borderWidth: 3,
-    borderColor: COLORS.wall,
-    borderRadius: 4,
+    borderRadius: 2,
   },
   cell: {
     position: 'absolute',
-    justifyContent: 'center',
-    alignItems: 'center',
   },
-  pellet: {
-    width: 4,
-    height: 4,
-    backgroundColor: COLORS.pellet,
+  wallCell: {
+    backgroundColor: COLORS.wall,
     borderRadius: 2,
   },
-  powerPellet: {
-    width: 12,
-    height: 12,
-    backgroundColor: COLORS.powerPellet,
-    borderRadius: 6,
-  },
-  powerPelletFlash: {
-    opacity: 0.3,
-  },
-  fruit: {
+  wallHighlight: {
     position: 'absolute',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 8,
+    top: 0,
+    left: 0,
+    right: 2,
+    height: 2,
+    backgroundColor: COLORS.wallHighlight,
+    borderTopLeftRadius: 2,
   },
-  cherryContainer: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-  },
-  cherry: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  cherryStem: {
+  wallShadow: {
     position: 'absolute',
-    top: -4,
-    left: 6,
-    width: 2,
-    height: 6,
-    backgroundColor: '#00FF00',
-  },
-  strawberry: {
-    width: 14,
-    height: 16,
-    borderRadius: 7,
-    borderBottomLeftRadius: 2,
+    bottom: 0,
+    right: 0,
+    left: 2,
+    height: 2,
+    backgroundColor: COLORS.wallShadow,
     borderBottomRightRadius: 2,
   },
-  strawberryLeaf: {
-    position: 'absolute',
-    top: -3,
-    left: 3,
-    width: 8,
-    height: 4,
-    backgroundColor: '#00FF00',
-    borderRadius: 2,
-  },
-  strawberrySeed: {
-    position: 'absolute',
-    top: 6,
-    left: '30%',
-    width: 2,
-    height: 2,
-    backgroundColor: '#FFFF00',
-    borderRadius: 1,
-  },
-  orange: {
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-  },
-  orangeLeaf: {
-    position: 'absolute',
-    top: -4,
-    left: 5,
-    width: 6,
-    height: 4,
-    backgroundColor: '#00FF00',
-    borderRadius: 2,
-  },
-  pretzel: {
-    width: 14,
-    height: 14,
-    borderWidth: 3,
-    borderRadius: 7,
-    backgroundColor: 'transparent',
-  },
-  apple: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-  },
-  appleStem: {
-    position: 'absolute',
-    top: -4,
-    left: 6,
-    width: 2,
-    height: 5,
-    backgroundColor: '#8B4513',
-  },
-  appleLeaf: {
-    position: 'absolute',
-    top: -3,
-    left: 8,
-    width: 5,
+  pellet: {
+    width: 3,
     height: 3,
-    backgroundColor: '#00FF00',
-    borderRadius: 2,
+    backgroundColor: COLORS.pellet,
+    borderRadius: 1.5,
+    alignSelf: 'center',
+    marginTop: 5,
   },
-  pear: {
-    width: 12,
-    height: 16,
-    borderRadius: 6,
-    borderTopLeftRadius: 4,
-    borderTopRightRadius: 4,
+  pelletHighlight: {
+    width: 1,
+    height: 1,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 0.5,
+    position: 'absolute',
+    top: 0,
+    left: 0,
   },
-  banana: {
-    width: 16,
+  powerPellet: {
+    width: 10,
     height: 10,
-    borderRadius: 8,
-    borderTopLeftRadius: 2,
-    borderTopRightRadius: 2,
-    transform: [{ rotate: '-20deg' }],
+    backgroundColor: COLORS.powerPellet,
+    borderRadius: 5,
+    alignSelf: 'center',
+    marginTop: 2,
+  },
+  powerPelletHighlight: {
+    width: 3,
+    height: 3,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 1.5,
+    position: 'absolute',
+    top: 1,
+    left: 1,
   },
   player: {
     position: 'absolute',
@@ -913,41 +1088,79 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.player,
     borderRadius: 100,
     overflow: 'hidden',
-    position: 'relative',
+  },
+  pacmanHighlight: {
+    position: 'absolute',
+    top: 2,
+    left: 2,
+    width: '40%',
+    height: '40%',
+    backgroundColor: COLORS.playerHighlight,
+    borderRadius: 100,
+    opacity: 0.6,
   },
   pacmanMouth: {
     position: 'absolute',
     right: -2,
-    top: '20%',
-    width: '55%',
-    height: '60%',
+    width: '50%',
     backgroundColor: COLORS.background,
-    borderTopLeftRadius: 50,
-    borderBottomLeftRadius: 50,
+  },
+  pacmanEye: {
+    position: 'absolute',
+    top: '20%',
+    right: '35%',
+    width: 3,
+    height: 3,
+    backgroundColor: '#000',
+    borderRadius: 1.5,
   },
   pacmanBow: {
     position: 'absolute',
-    top: -4,
-    left: '25%',
-    width: 10,
+    top: -3,
+    left: '20%',
+    width: 12,
     height: 8,
+  },
+  bowLeft: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    width: 5,
+    height: 6,
     backgroundColor: '#FF0000',
-    borderRadius: 3,
-    zIndex: 1,
+    borderRadius: 2,
+    transform: [{ rotate: '-20deg' }],
+  },
+  bowRight: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    width: 5,
+    height: 6,
+    backgroundColor: '#FF0000',
+    borderRadius: 2,
+    transform: [{ rotate: '20deg' }],
+  },
+  bowCenter: {
+    position: 'absolute',
+    left: 4,
+    top: 2,
+    width: 4,
+    height: 4,
+    backgroundColor: '#CC0000',
+    borderRadius: 2,
   },
   pacmanBeautyMark: {
     position: 'absolute',
-    top: '25%',
-    right: '30%',
-    width: 3,
-    height: 3,
-    backgroundColor: '#000000',
-    borderRadius: 1.5,
+    top: '30%',
+    right: '25%',
+    width: 2,
+    height: 2,
+    backgroundColor: '#000',
+    borderRadius: 1,
   },
   ghost: {
     position: 'absolute',
-    justifyContent: 'center',
-    alignItems: 'center',
     zIndex: 9,
   },
   ghostBody: {
@@ -955,15 +1168,40 @@ const styles = StyleSheet.create({
     height: '100%',
     borderTopLeftRadius: 100,
     borderTopRightRadius: 100,
-    justifyContent: 'flex-start',
-    alignItems: 'center',
-    paddingTop: 4,
     overflow: 'visible',
+  },
+  ghostHighlight: {
+    position: 'absolute',
+    top: 2,
+    left: 3,
+    width: '35%',
+    height: '35%',
+    backgroundColor: 'rgba(255, 255, 255, 0.4)',
+    borderRadius: 100,
   },
   ghostEyes: {
     flexDirection: 'row',
     justifyContent: 'center',
+    position: 'absolute',
+    top: '25%',
+    left: 0,
+    right: 0,
+  },
+  ghostEyeWhite: {
+    width: 6,
+    height: 7,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 3,
+    marginHorizontal: 1,
+    justifyContent: 'center',
     alignItems: 'center',
+    overflow: 'hidden',
+  },
+  ghostPupil: {
+    width: 3,
+    height: 4,
+    backgroundColor: '#2121DE',
+    borderRadius: 1.5,
   },
   ghostEyesOnly: {
     flexDirection: 'row',
@@ -971,76 +1209,157 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     height: '100%',
   },
-  ghostEyeWhite: {
-    width: 7,
-    height: 8,
+  eatenEye: {
+    width: 8,
+    height: 9,
     backgroundColor: '#FFFFFF',
     borderRadius: 4,
-    marginHorizontal: 1,
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-    paddingBottom: 1,
-  },
-  ghostEyeWhiteLarge: {
-    width: 9,
-    height: 10,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 5,
     marginHorizontal: 2,
-    justifyContent: 'flex-end',
+    justifyContent: 'center',
     alignItems: 'center',
-    paddingBottom: 2,
   },
-  frightenedEye: {
-    width: 5,
-    height: 5,
-    backgroundColor: '#FFB8FF',
-    borderRadius: 2.5,
-  },
-  ghostEyePupil: {
+  eatenPupil: {
     width: 4,
     height: 5,
     backgroundColor: '#2121DE',
     borderRadius: 2,
   },
-  ghostEyePupilLarge: {
-    width: 5,
-    height: 6,
-    backgroundColor: '#2121DE',
-    borderRadius: 2.5,
-  },
-  frightenedMouth: {
-    flexDirection: 'row',
-    marginTop: 3,
+  frightenedEye: {
+    width: 4,
     height: 4,
-    alignItems: 'flex-end',
+    backgroundColor: '#FFB8B8',
+    borderRadius: 2,
+    marginHorizontal: 3,
   },
-  frightenedTooth: {
+  frightenedMouthContainer: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    position: 'absolute',
+    bottom: '30%',
+    left: 0,
+    right: 0,
+  },
+  frightenedMouthSegment: {
     width: 3,
-    height: 3,
-    backgroundColor: '#FFB8FF',
-    marginHorizontal: 1,
+    height: 2,
+    marginHorizontal: 0.5,
+    borderRadius: 1,
   },
   ghostSkirt: {
     position: 'absolute',
     bottom: 0,
+    left: 0,
+    right: 0,
     flexDirection: 'row',
-    width: '100%',
     justifyContent: 'center',
   },
-  ghostLeg: {
+  ghostWave: {
+    width: 4,
+    height: 5,
+    borderBottomLeftRadius: 4,
+    borderBottomRightRadius: 4,
+    marginHorizontal: 0.5,
+  },
+  fruit: {
+    position: 'absolute',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 8,
+  },
+  cherryContainer: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    position: 'relative',
+  },
+  cherry: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+  },
+  cherryHighlight: {
+    position: 'absolute',
+    top: 1,
+    left: 1,
+    width: 2,
+    height: 2,
+    borderRadius: 1,
+  },
+  cherryStem: {
+    position: 'absolute',
+    top: -5,
+    left: 5,
+    width: 2,
+    height: 6,
+    backgroundColor: '#00AA00',
+    borderRadius: 1,
+    transform: [{ rotate: '15deg' }],
+  },
+  cherryLeaf: {
+    position: 'absolute',
+    top: -4,
+    left: 6,
+    width: 4,
+    height: 3,
+    backgroundColor: '#00DD00',
+    borderRadius: 2,
+  },
+  strawberry: {
+    width: 12,
+    height: 14,
+    borderRadius: 6,
+    borderBottomLeftRadius: 2,
+    borderBottomRightRadius: 2,
+  },
+  strawberryHighlight: {
+    position: 'absolute',
+    top: 2,
+    left: 2,
+    width: 4,
+    height: 4,
+    borderRadius: 2,
+  },
+  strawberryLeaves: {
+    position: 'absolute',
+    top: -3,
+    left: 3,
+    width: 6,
+    height: 4,
+    backgroundColor: '#00DD00',
+    borderRadius: 2,
+  },
+  strawberrySeed: {
+    position: 'absolute',
+    top: '40%',
+    left: '30%',
+    width: 2,
+    height: 2,
+    backgroundColor: '#FFFF00',
+    borderRadius: 1,
+  },
+  orange: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+  },
+  orangeHighlight: {
+    position: 'absolute',
+    top: 2,
+    left: 2,
     width: 5,
     height: 5,
-    borderBottomLeftRadius: 5,
-    borderBottomRightRadius: 5,
+    borderRadius: 2.5,
   },
-  ghostLegGap: {
-    width: 2,
-    height: 5,
-    backgroundColor: COLORS.background,
+  orangeStem: {
+    position: 'absolute',
+    top: -3,
+    left: 5,
+    width: 4,
+    height: 3,
+    backgroundColor: '#00AA00',
+    borderRadius: 2,
   },
   controls: {
-    marginTop: 15,
+    marginTop: 12,
     alignItems: 'center',
   },
   controlRow: {
@@ -1049,77 +1368,104 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   controlButton: {
-    width: 65,
-    height: 65,
-    backgroundColor: 'rgba(33, 33, 222, 0.7)',
-    borderRadius: 12,
+    width: 55,
+    height: 55,
+    backgroundColor: '#2a2a4a',
+    borderRadius: 8,
     justifyContent: 'center',
     alignItems: 'center',
-    margin: 3,
+    margin: 2,
     borderWidth: 2,
-    borderColor: 'rgba(33, 33, 222, 1)',
+    borderColor: '#4a4a6a',
+    borderBottomColor: '#1a1a3a',
+    borderRightColor: '#1a1a3a',
   },
-  controlSpacer: {
-    width: 65,
-    height: 65,
-    margin: 3,
+  controlCenter: {
+    width: 55,
+    height: 55,
+    backgroundColor: '#1a1a2e',
+    borderRadius: 8,
+    margin: 2,
+  },
+  dpadArrow: {
+    width: 24,
+    height: 24,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  dpadTriangle: {
+    width: 0,
+    height: 0,
+    backgroundColor: 'transparent',
+    borderStyle: 'solid',
+    borderLeftWidth: 10,
+    borderRightWidth: 10,
+    borderBottomWidth: 16,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: '#FFFFFF',
   },
   overlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0, 0, 0, 0.92)',
+    backgroundColor: 'rgba(0, 0, 0, 0.95)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 15,
   },
   dyingOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(255, 0, 0, 0.4)',
-    justifyContent: 'center',
-    alignItems: 'center',
+    backgroundColor: 'rgba(255, 0, 0, 0.3)',
   },
   titleText: {
     color: '#FFB8FF',
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    textAlign: 'center',
     letterSpacing: 2,
   },
   titleTextBig: {
     color: COLORS.player,
-    fontSize: 28,
+    fontSize: 24,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 8,
+    marginBottom: 6,
     letterSpacing: 3,
   },
   subtitleText: {
-    color: COLORS.text,
-    fontSize: 10,
+    color: '#888',
+    fontSize: 9,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 15,
-    textAlign: 'center',
+    marginBottom: 12,
   },
   ghostIntro: {
-    marginBottom: 15,
+    marginBottom: 12,
   },
   ghostIntroItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginVertical: 3,
+    marginVertical: 2,
   },
   miniGhost: {
-    width: 18,
-    height: 18,
-    borderTopLeftRadius: 9,
-    borderTopRightRadius: 9,
+    width: 16,
+    height: 16,
+    borderTopLeftRadius: 8,
+    borderTopRightRadius: 8,
     marginRight: 8,
-    justifyContent: 'center',
-    alignItems: 'center',
+    overflow: 'hidden',
+  },
+  miniGhostHighlight: {
+    position: 'absolute',
+    top: 2,
+    left: 2,
+    width: 5,
+    height: 5,
+    backgroundColor: 'rgba(255, 255, 255, 0.4)',
+    borderRadius: 2.5,
   },
   miniGhostEyes: {
     flexDirection: 'row',
-    marginTop: -2,
+    justifyContent: 'center',
+    marginTop: 3,
   },
   miniGhostEye: {
     width: 4,
@@ -1127,121 +1473,107 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 2,
     marginHorizontal: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  miniGhostPupil: {
+    width: 2,
+    height: 3,
+    backgroundColor: '#2121DE',
+    borderRadius: 1,
   },
   ghostName: {
-    color: COLORS.text,
-    fontSize: 12,
+    color: '#FFFFFF',
+    fontSize: 11,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   startButton: {
     backgroundColor: COLORS.player,
-    paddingHorizontal: 25,
-    paddingVertical: 12,
-    borderRadius: 8,
+    paddingHorizontal: 24,
+    paddingVertical: 10,
+    borderRadius: 6,
     marginTop: 8,
+    borderWidth: 2,
+    borderColor: COLORS.playerHighlight,
+    borderBottomColor: COLORS.playerShadow,
+    borderRightColor: COLORS.playerShadow,
   },
   startButtonText: {
-    color: COLORS.background,
-    fontSize: 16,
-    fontWeight: 'bold',
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    letterSpacing: 1,
-  },
-  secondaryButton: {
-    backgroundColor: 'transparent',
-    borderWidth: 2,
-    borderColor: COLORS.text,
-    paddingHorizontal: 25,
-    paddingVertical: 10,
-    borderRadius: 8,
-    marginTop: 12,
-  },
-  secondaryButtonText: {
-    color: COLORS.text,
+    color: '#000',
     fontSize: 14,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    letterSpacing: 1,
   },
-  instructionText: {
-    color: 'rgba(255, 255, 255, 0.5)',
-    fontSize: 10,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginTop: 12,
+  quitButton: {
+    paddingHorizontal: 24,
+    paddingVertical: 8,
+    marginTop: 10,
+    borderWidth: 2,
+    borderColor: '#666',
+    borderRadius: 6,
   },
-  highScoreReadyText: {
-    color: '#FFB8FF',
+  quitButtonText: {
+    color: '#888',
     fontSize: 12,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginTop: 15,
+  },
+  instructionText: {
+    color: '#555',
+    fontSize: 9,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    marginTop: 10,
+  },
+  highScoreReadyText: {
+    color: '#FF69B4',
+    fontSize: 10,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    marginTop: 10,
   },
   pausedText: {
     color: COLORS.player,
-    fontSize: 32,
-    fontWeight: 'bold',
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 15,
-    letterSpacing: 3,
-  },
-  gameOverText: {
-    color: '#FF0000',
     fontSize: 28,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
     marginBottom: 15,
-    letterSpacing: 2,
   },
-  levelCompleteText: {
-    color: '#00FF00',
+  gameOverText: {
+    color: '#FF0000',
     fontSize: 24,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    letterSpacing: 2,
+    marginBottom: 10,
+  },
+  levelCompleteText: {
+    color: '#00FF00',
+    fontSize: 22,
+    fontWeight: 'bold',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   levelCompleteSubtext: {
     color: '#00FF00',
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 15,
-    letterSpacing: 2,
+    marginBottom: 10,
   },
   finalScoreText: {
-    color: COLORS.text,
+    color: '#FFFFFF',
     fontSize: 20,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
     marginBottom: 8,
   },
   newHighScoreText: {
     color: '#FFD700',
-    fontSize: 14,
+    fontSize: 12,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 5,
+    marginBottom: 8,
   },
-  bonusText: {
-    color: '#00FFFF',
-    fontSize: 14,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 15,
-  },
-  highScoreOverlayText: {
-    color: '#FFB8FF',
-    fontSize: 16,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 15,
-  },
-  dyingText: {
-    color: '#FF0000',
-    fontSize: 40,
-    fontWeight: 'bold',
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-  },
-  powerStatus: {
-    marginTop: 10,
+  powerIndicator: {
+    marginTop: 8,
     alignItems: 'center',
   },
-  powerStatusText: {
+  powerText: {
     color: '#FFB8FF',
     fontSize: 12,
     fontWeight: 'bold',
@@ -1252,6 +1584,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: 'bold',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginTop: 4,
+    marginTop: 2,
   },
 });

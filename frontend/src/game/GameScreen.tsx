@@ -59,10 +59,11 @@ const FRUIT_COLORS: Record<FruitType, { main: string; highlight: string }> = {
   banana: { main: '#FFE135', highlight: '#FFFF99' },
 };
 
-// Timing - 60fps arcade accurate
+// Timing - 60fps arcade accurate with smoother movement
 const FRAME_TIME = 1000 / 60; // ~16.67ms
-const MOVE_FRAMES = 8; // Frames per tile movement (smoother)
-const GHOST_MOVE_FRAMES = 9; // Ghosts slightly slower
+const MOVE_FRAMES = 12; // More frames per tile for smoother movement
+const GHOST_MOVE_FRAMES = 14; // Ghosts slightly slower
+const ANIMATION_FRAMES = 16; // Frames for mouth animation cycle
 
 // Sound Manager with synthesized arcade sounds
 class ArcadeSoundManager {
@@ -70,7 +71,8 @@ class ArcadeSoundManager {
   private enabled: boolean = true;
   private audioContext: AudioContext | null = null;
   private chompPhase: number = 0;
-  private sirenOscillator: OscillatorNode | null = null;
+  private chompCounter: number = 0;
+  private masterVolume: number = 0.03; // Lower overall volume
   
   private constructor() {
     if (Platform.OS === 'web' && typeof window !== 'undefined') {
@@ -97,7 +99,7 @@ class ArcadeSoundManager {
     return this.enabled;
   }
 
-  private playTone(frequency: number, duration: number, type: OscillatorType = 'square', volume: number = 0.1) {
+  private playTone(frequency: number, duration: number, type: OscillatorType = 'square', volume: number = 0.03) {
     if (!this.enabled || !this.audioContext) return;
     
     try {
@@ -110,8 +112,10 @@ class ArcadeSoundManager {
       oscillator.type = type;
       oscillator.frequency.setValueAtTime(frequency, this.audioContext.currentTime);
       
-      gainNode.gain.setValueAtTime(volume, this.audioContext.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + duration);
+      // Lower volume with smooth decay
+      const actualVolume = volume * this.masterVolume * 10;
+      gainNode.gain.setValueAtTime(actualVolume, this.audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, this.audioContext.currentTime + duration);
       
       oscillator.start(this.audioContext.currentTime);
       oscillator.stop(this.audioContext.currentTime + duration);
@@ -120,22 +124,25 @@ class ArcadeSoundManager {
     }
   }
 
-  // Waka-waka chomp sound - alternates between two tones
+  // Waka-waka chomp sound - only plays every 3rd pellet for less noise
   public playChomp() {
+    this.chompCounter++;
+    if (this.chompCounter % 3 !== 0) return; // Only play every 3rd pellet
+    
     this.chompPhase = 1 - this.chompPhase;
-    const freq = this.chompPhase === 0 ? 261 : 293; // C4 and D4
-    this.playTone(freq, 0.05, 'square', 0.08);
+    const freq = this.chompPhase === 0 ? 220 : 260; // Lower frequencies
+    this.playTone(freq, 0.04, 'sine', 0.025); // Softer sine wave
   }
 
-  // Power pellet - descending arpeggio
+  // Power pellet - gentle ascending tone
   public playPowerPellet() {
-    const notes = [523, 659, 784, 1047]; // C5, E5, G5, C6
+    const notes = [440, 550, 660, 880];
     notes.forEach((freq, i) => {
-      setTimeout(() => this.playTone(freq, 0.1, 'square', 0.12), i * 50);
+      setTimeout(() => this.playTone(freq, 0.08, 'sine', 0.04), i * 60);
     });
   }
 
-  // Ghost eaten - rising sweep
+  // Ghost eaten - soft rising sweep
   public playGhostEaten() {
     if (!this.enabled || !this.audioContext) return;
     
@@ -146,45 +153,45 @@ class ArcadeSoundManager {
       oscillator.connect(gainNode);
       gainNode.connect(this.audioContext.destination);
       
-      oscillator.type = 'square';
-      oscillator.frequency.setValueAtTime(200, this.audioContext.currentTime);
-      oscillator.frequency.exponentialRampToValueAtTime(800, this.audioContext.currentTime + 0.2);
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(180, this.audioContext.currentTime);
+      oscillator.frequency.exponentialRampToValueAtTime(600, this.audioContext.currentTime + 0.15);
       
-      gainNode.gain.setValueAtTime(0.15, this.audioContext.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + 0.3);
+      gainNode.gain.setValueAtTime(0.04, this.audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, this.audioContext.currentTime + 0.2);
       
       oscillator.start(this.audioContext.currentTime);
-      oscillator.stop(this.audioContext.currentTime + 0.3);
+      oscillator.stop(this.audioContext.currentTime + 0.2);
     } catch (e) {}
   }
 
-  // Death sound - descending tones
+  // Death sound - gentle descending tones
   public playDeath() {
-    const notes = [523, 493, 440, 392, 349, 330, 294, 262, 220, 196, 165, 131];
+    const notes = [400, 350, 300, 260, 220, 180];
     notes.forEach((freq, i) => {
-      setTimeout(() => this.playTone(freq, 0.08, 'square', 0.1), i * 80);
+      setTimeout(() => this.playTone(freq, 0.1, 'sine', 0.03), i * 100);
     });
   }
 
-  // Level complete - victory fanfare
+  // Level complete - soft victory melody
   public playLevelComplete() {
-    const melody = [523, 659, 784, 1047, 784, 1047];
+    const melody = [440, 550, 660, 880];
     melody.forEach((freq, i) => {
-      setTimeout(() => this.playTone(freq, 0.15, 'square', 0.12), i * 100);
+      setTimeout(() => this.playTone(freq, 0.12, 'sine', 0.035), i * 120);
     });
   }
 
-  // Fruit eaten - happy blip
+  // Fruit eaten - gentle blip
   public playFruitEaten() {
-    this.playTone(880, 0.05, 'square', 0.1);
-    setTimeout(() => this.playTone(1100, 0.08, 'square', 0.1), 60);
+    this.playTone(660, 0.06, 'sine', 0.025);
+    setTimeout(() => this.playTone(880, 0.06, 'sine', 0.025), 70);
   }
 
-  // Start game jingle
+  // Start game jingle - quiet and pleasant
   public playStartGame() {
-    const notes = [262, 330, 392, 523];
+    const notes = [330, 392, 440, 523];
     notes.forEach((freq, i) => {
-      setTimeout(() => this.playTone(freq, 0.12, 'square', 0.1), i * 120);
+      setTimeout(() => this.playTone(freq, 0.1, 'sine', 0.03), i * 100);
     });
   }
 
@@ -248,36 +255,37 @@ export default function GameScreen() {
   // Initialize ghost position shared values - NOT using hooks in map
   // Ghost positions will be calculated directly without shared values for now
 
-  // Sync player position with smooth animation
+  // Sync player position with smooth animation - longer duration for smoother movement
   useEffect(() => {
     const targetX = playerPosition.x * CELL_SIZE;
     const targetY = playerPosition.y * CELL_SIZE;
     
+    // Smoother easing with longer duration
     playerX.value = withTiming(targetX, {
-      duration: FRAME_TIME * MOVE_FRAMES,
-      easing: Easing.linear,
+      duration: FRAME_TIME * MOVE_FRAMES * 0.9, // Slightly faster than move rate for overlap
+      easing: Easing.out(Easing.quad), // Smooth deceleration
     });
     playerY.value = withTiming(targetY, {
-      duration: FRAME_TIME * MOVE_FRAMES,
-      easing: Easing.linear,
+      duration: FRAME_TIME * MOVE_FRAMES * 0.9,
+      easing: Easing.out(Easing.quad),
     });
   }, [playerPosition.x, playerPosition.y]);
 
   // Ghost positions will be animated via state changes
 
-  // Calculate move speed based on level
+  // Calculate move speed based on level - smoother with more frames
   const getMoveFrames = useCallback(() => {
-    // Speed up slightly each level
-    return Math.max(5, MOVE_FRAMES - Math.floor((level - 1) * 0.5));
+    // Speed up slightly each level but keep smooth
+    return Math.max(8, MOVE_FRAMES - Math.floor((level - 1) * 0.4));
   }, [level]);
 
-  // Main game loop - 60fps
+  // Main game loop - 60fps with smoother animations
   useEffect(() => {
     if (gameStatus !== 'playing') return;
 
     let running = true;
     const moveFrames = getMoveFrames();
-    const ghostMoveFrames = moveFrames + 1;
+    const ghostMoveFrames = moveFrames + 2; // Ghosts move slightly slower
 
     const gameLoop = (timestamp: number) => {
       if (!running) return;
@@ -288,15 +296,18 @@ export default function GameScreen() {
         frameCount.current++;
         lastFrameTime.current = timestamp;
         
-        // Mouth animation (8 frames per cycle)
-        const mouthCycle = frameCount.current % 8;
-        setMouthAngle(Math.sin(mouthCycle / 8 * Math.PI * 2) * 45);
+        // Smoother mouth animation (16 frames per cycle for fluid movement)
+        const mouthCycle = frameCount.current % ANIMATION_FRAMES;
+        const mouthProgress = mouthCycle / ANIMATION_FRAMES;
+        // Smooth sine wave for natural opening/closing
+        setMouthAngle(Math.sin(mouthProgress * Math.PI * 2) * 40);
         
-        // Ghost wiggle animation
-        setGhostWiggle(Math.sin(frameCount.current / 4) * 2);
+        // Smoother ghost wiggle animation (more gradual)
+        const wiggleProgress = frameCount.current / 8;
+        setGhostWiggle(Math.sin(wiggleProgress) * 1.5);
         
-        // Power pellet flash
-        if (powerPelletActive && frameCount.current % 8 === 0) {
+        // Power pellet flash (slower flash rate)
+        if (powerPelletActive && frameCount.current % 12 === 0) {
           setPowerFlash(f => !f);
         }
         
@@ -308,12 +319,11 @@ export default function GameScreen() {
           eatPellet();
           checkGhostCollision();
           
-          // Play chomp sound when eating
-          const { pellets: currentPellets } = useGameStore.getState();
+          // Play chomp sound (less frequently)
           soundManager.playChomp();
         }
         
-        // Ghost movement
+        // Ghost movement (smoother timing)
         ghostMoveCounter.current++;
         if (ghostMoveCounter.current >= ghostMoveFrames) {
           ghostMoveCounter.current = 0;

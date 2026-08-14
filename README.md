@@ -1,5 +1,9 @@
 # 👾 Ms. Not Mr. Pac-Man
 
+> **Current implementation:** This is the active React Native and Expo version.
+> The earlier dependency-free Canvas prototype is preserved in
+> [game-from-nothing-](https://github.com/CarlosFranzetti/game-from-nothing-).
+
 > A love-letter to the arcade classic — **Ms. Pac-Man** — built with React Native / Expo and deployable on Vercel.
 
 ---
